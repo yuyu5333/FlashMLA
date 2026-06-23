@@ -181,7 +181,9 @@ fwd_kvcache_mla_packed_fp8(
     const std::optional<at::Tensor> &packed_kcache,
     const std::optional<at::Tensor> &scale_kcache,
     const std::optional<at::Tensor> &R_matrix,
-    const std::optional<at::Tensor> &zero_point
+    const std::optional<at::Tensor> &zero_point,
+    const std::optional<at::Tensor> &dim_of_bit,
+    const std::optional<at::Tensor> &bitpos_in_dim
 ) {
     // -----------------------------------------------------------------
     // Mode selection.
@@ -198,7 +200,9 @@ fwd_kvcache_mla_packed_fp8(
         (packed_kcache.has_value() ? 1 : 0) +
         (scale_kcache.has_value()  ? 1 : 0) +
         (R_matrix.has_value()      ? 1 : 0) +
-        (zero_point.has_value()    ? 1 : 0);
+        (zero_point.has_value()    ? 1 : 0) +
+        (dim_of_bit.has_value()    ? 1 : 0) +
+        (bitpos_in_dim.has_value() ? 1 : 0);
 
     if (num_packed_present == 0) {
         // Bit-exact dense_fp8 fallback. This matches the pre-stage-1
@@ -211,10 +215,11 @@ fwd_kvcache_mla_packed_fp8(
             descale_q, descale_k);
     }
 
-    TORCH_CHECK(num_packed_present == 4,
+    TORCH_CHECK(num_packed_present == 6,
         "fwd_kvcache_mla_packed_fp8: packed-FP8 path requires either all "
-        "four of (packed_kcache, scale_kcache, R_matrix, zero_point) to "
-        "be None or all four non-None. Got non-None count=",
+        "six of (packed_kcache, scale_kcache, R_matrix, zero_point, "
+        "dim_of_bit, bitpos_in_dim) to be None or all six non-None. "
+        "Got non-None count=",
         num_packed_present,
         ". Banner=", flashmla_fork::kForkBanner);
 
@@ -392,16 +397,31 @@ fwd_kvcache_mla_packed_fp8(
     params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
     params.oaccum_ptr = out_accum.data_ptr();
 
-    // ---- [M3.c.4 Stage-1] install packed pointers into params ----
-    // The dense fp8 kernel does not read these fields yet; this wiring
-    // is what the next fork commit (inner-loop fused dequant) will
-    // consume. Until then, packed_* are dormant params and the launch
-    // below is byte-for-byte equivalent to fwd_kvcache_mla_fp8.
+    // ---- [M3.c.4 S2-S2] install packed pointers + pack meta into params ----
+    // S2-S2 kernel consumes these for fused bit-unpack + affine dequant
+    // + R@x + FP8 convert.
     {
         const at::Tensor &pk = packed_kcache.value();
         const at::Tensor &sk = scale_kcache.value();
         const at::Tensor &Rm = R_matrix.value();
         const at::Tensor &zp = zero_point.value();
+        const at::Tensor &dob = dim_of_bit.value();
+        const at::Tensor &bpd = bitpos_in_dim.value();
+
+        // Validate dim_of_bit / bitpos_in_dim
+        PFP8_CHECK_DEVICE(dob);
+        PFP8_CHECK_DEVICE(bpd);
+        PFP8_CHECK_CONTIGUOUS(dob);
+        PFP8_CHECK_CONTIGUOUS(bpd);
+        TORCH_CHECK(dob.dtype() == at::kInt, "dim_of_bit must be int32");
+        TORCH_CHECK(bpd.dtype() == at::kInt, "bitpos_in_dim must be int32");
+        TORCH_CHECK(dob.dim() == 1 && bpd.dim() == 1,
+            "dim_of_bit and bitpos_in_dim must be rank-1");
+        TORCH_CHECK(dob.size(0) == bpd.size(0),
+            "dim_of_bit and bitpos_in_dim must have same length");
+        const int row_bits_val = static_cast<int>(dob.size(0));
+        TORCH_CHECK(row_bits_val > 0, "row_bits must be positive");
+
         params.packed_kcache_ptr = pk.data_ptr();
         params.scale_kcache_ptr =
             reinterpret_cast<float *>(sk.data_ptr());
@@ -409,6 +429,10 @@ fwd_kvcache_mla_packed_fp8(
             reinterpret_cast<float *>(Rm.data_ptr());
         params.zero_point_ptr =
             reinterpret_cast<float *>(zp.data_ptr());
+        params.dim_of_bit_ptr =
+            reinterpret_cast<int *>(dob.data_ptr());
+        params.bitpos_in_dim_ptr =
+            reinterpret_cast<int *>(bpd.data());
         // packed_kcache is [N, row_bytes]; page-stride in bytes is
         // page_block_size * row_bytes (rows of the same page are
         // contiguous in row-major layout by construction).
@@ -417,6 +441,7 @@ fwd_kvcache_mla_packed_fp8(
             static_cast<DecodingParams_fp8::index_t>(page_block_size) *
             static_cast<DecodingParams_fp8::index_t>(packed_row_bytes);
         params.qk_nope_head_dim = qk_nope_head_dim;
+        params.row_bits = row_bits_val;
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();

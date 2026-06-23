@@ -175,6 +175,11 @@ struct SharedStorageMLA {
             SmemV_t smem_vt;
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutP>> smem_p;
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_scale;
+            // S2-S2 packed-KV dequant staging buffer (dense row-major FP8).
+            // Only the nope half (qk_nope_head_dim) is staged here;
+            // rope half is written directly to sK via tKsK.
+            // qk_nope_head_dim = kHeadDim - 64 (rope), kHeadDim=576 -> 512.
+            cute::array_aligned<typename Kernel_traits::Element, 64 * 512> smem_k_dense_nope;
         };
         struct {
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_max;
@@ -431,72 +436,24 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                                                               params.q_seq_per_hk - m_block * kBlockM);
 
         // ============================================================
-        // [M3.c.4 Stage-2 INSERTION CONTRACT — packed-FP8 KV load path]
+        // [M3.c.4 Stage-2 packed-FP8 KV load — branch dispatch]
         //
-        // **Current state (Stage-1)**: this code path unconditionally reads
-        // a *dense* FP8 K cache (params.k_ptr, shape [N, kHeadDim=576],
-        // dtype float_e4m3_t, row stride params.k_row_stride). The four
-        // packed_*_ptr fields installed by dense_fp8_packed_entry.cpp are
-        // present in `params` but ignored here. As a result, when the host
-        // entry is called with 4 real packed tensors AND a real shadow
-        // dense k_ptr, the kernel produces bit-exact dense_fp8 output and
-        // the shadow buffer is wasted memory — this is what the Stage-1
-        // wiring promises (kernel-side handshake bring-up only).
+        // S2-S1 (this commit): gmem read-path validation. Both sides
+        // still fill sK from dense FP8 (bit-exact guarantee). The
+        // packed!=nullptr branch additionally probes all 4 packed
+        // tensors (packed_kcache / scale_kcache / R_matrix /
+        // zero_point) to validate pointer arithmetic + reachability.
         //
-        // **Stage-2 replacement (next FlashMLA fork commit)**: when
-        // params.packed_kcache_ptr != nullptr we should:
+        // S2-S2 (next): real fused dequant — INT-N unpack + affine +
+        // R@x + FP8 convert → sK nope-half, dense shadow removed.
         //
-        //   1. Read packed bytes from gmem:
-        //        uint8_t* pk = params.packed_kcache_ptr
-        //                    + (size_t)cur_block_table * params.packed_k_batch_stride
-        //                    + slot_within_page * params.packed_row_bytes;
-        //      cooperative cp.async into a smem staging buffer.
-        //
-        //   2. Per-element INT-N affine dequant:
-        //        x_fp32[d] = unpack(pk, d) * scale[slot, d] + zero[d]
-        //      where scale = params.scale_kcache_ptr (fp32 [N, qk_nope])
-        //        and zero  = params.zero_point_ptr   (fp32 [qk_nope]).
-        //
-        //   3. Apply rotation R (dense orthogonal, fp32 [qk_nope, qk_nope]):
-        //        y_fp32[d] = sum_k R[d, k] * x_fp32[k]
-        //      R = params.R_matrix_ptr; broadcast across all (bidb, n_block,
-        //      slot). Must be smem-cached and tiled because
-        //      qk_nope_head_dim=448 -> R is 448*448*4B = 786KB > smem cap.
-        //
-        //   4. FP8 convert + concatenate with the rope-half BF16 suffix
-        //      (still living in the same packed row after the nope bytes):
-        //        sK[slot, 0       : qk_nope ]     = (float_e4m3_t) y_fp32
-        //        sK[slot, qk_nope : kHeadDim]     = bf16->fp8(rope_half)
-        //      (kHeadDim = qk_nope + qk_rope = 448 + 64 = 576)
-        //
-        // **Invariants the Stage-2 commit MUST preserve**:
-        //   * Double-buffer sK layout (sK_offset switch in main loop).
-        //   * cp_async fence ordering (cp_async_fence right before main loop).
-        //   * NamedBarriers SReady / TransVReady / SoftmaxReady contract.
-        //   * Same FP8 V transpose path (SmemTransposeFp8_64x64).
-        //   * Branch on params.packed_kcache_ptr == nullptr keeps original
-        //     dense gmem load unchanged (Stage-2 bit-exact == Stage-1 dense
-        //     when packed_kcache_ptr is nullptr).
-        //
-        // **Why not done in this commit**: implementing 1-4 correctly
-        // requires ~500-800 lines of CuTe (R-tile sizing, smem reuse for R,
-        // warp-specialized unpack pipeline) and would couple compile risk
-        // with the Stage-1 bring-up. We split that into the next commit so
-        // Stage-1 host wiring + container rebuild + fork_probe smoke can be
-        // validated end-to-end first.
-        //
-        // **Stage-2 trip-wire is intentionally NOT added here**: a
-        // CUDA-side assert in __device__ code would couple this thin
-        // documentation commit with runtime trap semantics (compute
-        // capability gating, NDEBUG flag uncertainty, kernel launch
-        // failure surfaced as `cudaErrorAssert` on every call). For the
-        // Stage-1 bring-up we want pure dense_fp8 byte-equivalence; any
-        // device-side guard belongs in the Stage-2 commit that actually
-        // implements the branch. The host entry
-        // `fwd_kvcache_mla_packed_fp8` already validates the all-4-None
-        // vs all-4-set partition and rejects the mixed case at the
-        // PyTorch boundary, so a kernel-side guard is redundant for now.
+        // Invariant: when params.packed_kcache_ptr == nullptr this
+        // code path is byte-identical to Stage-1 dense_fp8.
         // ============================================================
+
+        // Dense K-load variables (used by both branches in S2-S1;
+        // lifted to outer scope because the main-loop prefetch below
+        // also references them).
         const index_t row_offset_k = (bidh / params.h_h_k_ratio) * params.k_head_stride;
         Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
@@ -518,12 +475,139 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
             }
         }
 
-        // We need to clear the sK smem tiles because K is V.
-        const index_t offset_k = cur_block_table * params.k_batch_stride;
-        tKgK.data() = tKgK.data() + offset_k;
-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
-                                                                                        seqlen_k - n_block * kBlockN);
-        tKgK.data() = tKgK.data() + -offset_k;
+        if (params.packed_kcache_ptr == nullptr) {
+            // ---- Dense FP8 K-load path (original, unchanged) ----
+            // We need to clear the sK smem tiles because K is V.
+            const index_t offset_k = cur_block_table * params.k_batch_stride;
+            tKgK.data() = tKgK.data() + offset_k;
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true, /*Clear_OOB_MN=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK,
+                                                                                            seqlen_k - n_block * kBlockN);
+            tKgK.data() = tKgK.data() + -offset_k;
+        } else {
+            // ---- Packed FP8 K-load path (S2-S2: real fused dequant) ----
+            //
+            // Pipeline:
+            //   1. Bit-unpack (per-channel variable-width, dim_of_bit/bitpos_in_dim)
+            //   2. Affine dequant: x = codes * scale + zero_point
+            //   3. R @ x rotation (448x448 matrix-vector per token)
+            //   4. FP8 e4m3 convert
+            //   5. Write nope-half to sK via dense staging buffer
+            //   6. Rope half: BF16 -> FP8 direct copy
+            //
+            // 128 threads (warp group 1) process 64 tokens collaboratively.
+            // Tokens are processed one at a time across all threads; each
+            // thread owns 448/128 ≈ 3.5 output dims per token.
+
+            const int qk_nope = params.qk_nope_head_dim;
+            const int page_block_size = params.page_block_size;
+            const int row_bits = params.row_bits;
+            const int lid = (int)(tidx - kNThreadsS);  // 0..127
+
+            // Pointers
+            const index_t pk_block_byte = (index_t)cur_block_table * params.packed_k_batch_stride;
+            const uint8_t* pk_base = reinterpret_cast<const uint8_t*>(params.packed_kcache_ptr) + pk_block_byte;
+            const index_t sk_block_elems = (index_t)page_block_size * qk_nope;
+            const float* sk_base = reinterpret_cast<const float*>(params.scale_kcache_ptr) + (index_t)cur_block_table * sk_block_elems;
+            const float* R_base = reinterpret_cast<const float*>(params.R_matrix_ptr);
+            const float* zp_base = reinterpret_cast<const float*>(params.zero_point_ptr);
+            const int* dob_base = params.dim_of_bit_ptr;
+            const int* bpd_base = params.bitpos_in_dim_ptr;
+
+            // Dense staging buffer pointer (row-major FP8: 64 x 448)
+            Element* dense_nope = reinterpret_cast<Element*>(shared_storage.smem_k_dense_nope.data());
+            const int packed_row_bytes = params.packed_row_bytes;
+            const int nope_bytes = packed_row_bytes - 128;  // rope is 128 bytes at end
+
+            // ---- Step 1: dequant all 64 tokens into dense_nope buffer ----
+            // We process tokens one at a time. For each token:
+            //   (a) bit-unpack all row_bits bits -> codes[qk_nope] in smem
+            //   (b) affine + R@x -> result[qk_nope] (each thread owns ~3.5 dims)
+            //   (c) FP8 convert -> dense_nope[token][d]
+
+            // Shared mem for per-token intermediate (FP32 codes and x)
+            __shared__ float s_x[448];   // affine-dequantized x (input to R@x)
+            __shared__ int s_codes[448]; // bit-unpacked integer codes
+
+            for (int tok = 0; tok < 64; ++tok) {
+                // --- (a) bit-unpack: 128 threads share the work ---
+                // Initialize codes to zero
+                for (int d = lid; d < qk_nope; d += 128) {
+                    s_codes[d] = 0;
+                }
+                __syncthreads();
+
+                // Each thread handles a slice of row_bits bits
+                for (int bit_idx = lid; bit_idx < row_bits; bit_idx += 128) {
+                    const int d = dob_base[bit_idx];
+                    const int bpos = bpd_base[bit_idx];
+                    const int byte_idx = bit_idx >> 3;
+                    const int bit_in_byte = bit_idx & 7;
+                    if (byte_idx < nope_bytes) {
+                        const uint8_t byte_val = pk_base[tok * packed_row_bytes + byte_idx];
+                        const int bit_val = (byte_val >> bit_in_byte) & 1;
+                        atomicOr(&s_codes[d], bit_val << bpos);
+                    }
+                }
+                __syncthreads();
+
+                // --- (b) affine dequant: x[d] = codes[d] * scale[d] + zero[d] ---
+                // Also load scale for this token
+                for (int d = lid; d < qk_nope; d += 128) {
+                    const float s = sk_base[tok * qk_nope + d];
+                    const float z = zp_base[d];
+                    s_x[d] = (float)s_codes[d] * s + z;
+                }
+                __syncthreads();
+
+                // --- (c) R @ x: each thread owns qk_nope / 128 output dims ---
+                // result[j] = sum_{d=0}^{qk_nope-1} R[j,d] * x[d]
+                // Note: R is [qk_nope, qk_nope] row-major (R[j,d] is row j, col d)
+                for (int j = lid; j < qk_nope; j += 128) {
+                    float sum = 0.0f;
+                    const float* R_row = R_base + j * qk_nope;
+                    #pragma unroll 1
+                    for (int d = 0; d < qk_nope; ++d) {
+                        sum += R_row[d] * s_x[d];
+                    }
+                    // FP8 e4m3 convert and write to dense staging buffer
+                    dense_nope[tok * qk_nope + j] = static_cast<Element>(sum);
+                }
+                __syncthreads();
+            }
+
+            // ---- Step 2: write nope half from dense buffer to sK (via tKsK) ----
+            // Each thread traverses its tKsK elements; for nope dims we
+            // read from the dense staging buffer.
+            #pragma unroll 1
+            for (int i = 0; i < size(tKsK); ++i) {
+                auto coord = tKcK(i);
+                const int n = get<0>(coord);
+                const int d = get<1>(coord);
+                if (d < qk_nope) {
+                    if (n < seqlen_k - n_block * kBlockN) {
+                        tKsK(i) = dense_nope[n * qk_nope + d];
+                    } else {
+                        tKsK(i) = Element{};
+                    }
+                } else {
+                    // ---- Rope half: BF16 -> FP8 direct copy ----
+                    // Rope starts at nope_bytes offset in each packed row.
+                    // rope has 64 BF16 elements = 128 bytes.
+                    const int rope_elem = d - qk_nope;
+                    if (rope_elem < 64 && n < seqlen_k - n_block * kBlockN) {
+                        const uint16_t* rope_bf16 = reinterpret_cast<const uint16_t*>(
+                            pk_base + n * packed_row_bytes + nope_bytes);
+                        const cutlass::bfloat16_t bf16_val =
+                            *reinterpret_cast<const cutlass::bfloat16_t*>(&rope_bf16[rope_elem]);
+                        const float fval = static_cast<float>(bf16_val);
+                        tKsK(i) = static_cast<Element>(fval);
+                    } else {
+                        tKsK(i) = Element{};
+                    }
+                }
+            }
+            __syncthreads();
+        }
         cute::cp_async_fence();
 
         if (n_block - 1 >= n_block_min) {
@@ -540,10 +624,102 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                 const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
                 tKsK.data() = tKsK.data() + sK_offset;
 
-                const index_t offset_k = cur_block_table * params.k_batch_stride;
-                tKgK.data() = tKgK.data() + offset_k;
-                flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK);
-                tKgK.data() = tKgK.data() + -offset_k;
+                if (params.packed_kcache_ptr == nullptr) {
+                    // ---- Dense FP8 prefetch ----
+                    const index_t offset_k = cur_block_table * params.k_batch_stride;
+                    tKgK.data() = tKgK.data() + offset_k;
+                    flash::copy</*Is_even_MN=*/true, /*Is_even_K=*/true>(gmem_tiled_copy_K, tKgK, tKsK, tKcK, tKpK);
+                    tKgK.data() = tKgK.data() + -offset_k;
+                } else {
+                    // ---- Packed FP8 prefetch (S2-S2: real fused dequant) ----
+                    // Same logic as prologue, but Is_even_MN=true (full block)
+                    const int qk_nope = params.qk_nope_head_dim;
+                    const int page_block_size = params.page_block_size;
+                    const int row_bits = params.row_bits;
+                    const int lid = (int)(tidx - kNThreadsS);  // 0..127
+
+                    const index_t pk_block_byte = (index_t)cur_block_table * params.packed_k_batch_stride;
+                    const uint8_t* pk_base = reinterpret_cast<const uint8_t*>(params.packed_kcache_ptr) + pk_block_byte;
+                    const index_t sk_block_elems = (index_t)page_block_size * qk_nope;
+                    const float* sk_base = reinterpret_cast<const float*>(params.scale_kcache_ptr) + (index_t)cur_block_table * sk_block_elems;
+                    const float* R_base = reinterpret_cast<const float*>(params.R_matrix_ptr);
+                    const float* zp_base = reinterpret_cast<const float*>(params.zero_point_ptr);
+                    const int* dob_base = params.dim_of_bit_ptr;
+                    const int* bpd_base = params.bitpos_in_dim_ptr;
+
+                    Element* dense_nope = reinterpret_cast<Element*>(shared_storage.smem_k_dense_nope.data());
+                    const int packed_row_bytes = params.packed_row_bytes;
+                    const int nope_bytes = packed_row_bytes - 128;
+
+                    __shared__ float s_x_pref[448];
+                    __shared__ int s_codes_pref[448];
+
+                    #pragma unroll 1
+                    for (int tok = 0; tok < 64; ++tok) {
+                        // (a) bit-unpack init
+                        for (int d = lid; d < qk_nope; d += 128) {
+                            s_codes_pref[d] = 0;
+                        }
+                        __syncthreads();
+
+                        for (int bit_idx = lid; bit_idx < row_bits; bit_idx += 128) {
+                            const int d = dob_base[bit_idx];
+                            const int bpos = bpd_base[bit_idx];
+                            const int byte_idx = bit_idx >> 3;
+                            const int bit_in_byte = bit_idx & 7;
+                            if (byte_idx < nope_bytes) {
+                                const uint8_t byte_val = pk_base[tok * packed_row_bytes + byte_idx];
+                                const int bit_val = (byte_val >> bit_in_byte) & 1;
+                                atomicOr(&s_codes_pref[d], bit_val << bpos);
+                            }
+                        }
+                        __syncthreads();
+
+                        // (b) affine dequant
+                        for (int d = lid; d < qk_nope; d += 128) {
+                            const float s = sk_base[tok * qk_nope + d];
+                            const float z = zp_base[d];
+                            s_x_pref[d] = (float)s_codes_pref[d] * s + z;
+                        }
+                        __syncthreads();
+
+                        // (c) R @ x
+                        for (int j = lid; j < qk_nope; j += 128) {
+                            float sum = 0.0f;
+                            const float* R_row = R_base + j * qk_nope;
+                            #pragma unroll 1
+                            for (int d = 0; d < qk_nope; ++d) {
+                                sum += R_row[d] * s_x_pref[d];
+                            }
+                            dense_nope[tok * qk_nope + j] = static_cast<Element>(sum);
+                        }
+                        __syncthreads();
+                    }
+
+                    // Write nope + rope to sK
+                    #pragma unroll 1
+                    for (int i = 0; i < size(tKsK); ++i) {
+                        auto coord = tKcK(i);
+                        const int n = get<0>(coord);
+                        const int d = get<1>(coord);
+                        if (d < qk_nope) {
+                            tKsK(i) = dense_nope[n * qk_nope + d];
+                        } else {
+                            const int rope_elem = d - qk_nope;
+                            if (rope_elem < 64) {
+                                const uint16_t* rope_bf16 = reinterpret_cast<const uint16_t*>(
+                                    pk_base + n * packed_row_bytes + nope_bytes);
+                                const cutlass::bfloat16_t bf16_val =
+                                    *reinterpret_cast<const cutlass::bfloat16_t*>(&rope_bf16[rope_elem]);
+                                const float fval = static_cast<float>(bf16_val);
+                                tKsK(i) = static_cast<Element>(fval);
+                            } else {
+                                tKsK(i) = Element{};
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
                 cute::cp_async_fence();
             }
 

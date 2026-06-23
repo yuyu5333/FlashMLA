@@ -92,14 +92,24 @@ struct DecodingParams_fp8 {
     // packed_row_bytes is the byte-stride of one (page,slot) row inside
     // packed_kcache; packed_k_batch_stride is the page-stride (i.e.
     // bytes per page, may include alignment padding).
+    //
+    // dim_of_bit / bitpos_in_dim are the per-config bit-packing metadata
+    // arrays (length = row_bits = sum(bits[d] for d in 0..qk_nope-1)).
+    // They are per-layer constants (same for every token) so they are
+    // passed as dense pointers (not block_table indexed).
+    //   dim_of_bit[i]     : which channel dim the i-th bit belongs to
+    //   bitpos_in_dim[i]  : which bit position (0..bits[d]-1) within that dim
     // ------------------------------------------------------------------
     void*  __restrict__ packed_kcache_ptr     = nullptr;
     float* __restrict__ scale_kcache_ptr      = nullptr;
     float* __restrict__ R_matrix_ptr          = nullptr;
     float* __restrict__ zero_point_ptr        = nullptr;
+    int*   __restrict__ dim_of_bit_ptr        = nullptr;
+    int*   __restrict__ bitpos_in_dim_ptr     = nullptr;
     index_t             packed_k_batch_stride = 0;
     int                 packed_row_bytes      = 0;
     int                 qk_nope_head_dim      = 0;
+    int                 row_bits              = 0;
 };
 
 static constexpr int TileSchedulerMetaDataSize = 8;

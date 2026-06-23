@@ -24,14 +24,15 @@ namespace flashmla_fork {
 // 20260623 = M3.c.4 stage-1 wiring: 4 packed tensors真实写入 DecodingParams_fp8，
 //             kernel 端尚未读取（params struct 加新字段默认 nullptr/0）。
 //             All-4 non-None 时 bit-exact == dense_fp8。
-// 20260624 = M3.c.4 stage-2 INSERTION CONTRACT: 在 flash_fwd_mla_kernel.h
-//             warp group 1 KV-load 路径 (else branch, tidx >= kNThreadsS)
-//             gK 构造之前插入 ~70 行 contract 注释，明确 Stage-2 device-side
-//             实现的输入/输出/不变量。**此 commit 零运行时变化**: kernel
-//             逻辑未改，所有 dense_fp8 / packed-stage-1 调用仍走原路。
-//             下一刀 = 真实现 Stage-2 fused dequant (INT-N unpack + R@x +
-//             ×scale+zero -> FP8 -> sK)，那时 banner 推到 20260625+。
-inline constexpr int64_t kForkBanner = 20260624LL;
+// 20260625 = M3.c.4 S2-S2: packed path real fused dequant in warp group 1.
+//             - bit-unpack (per-channel variable-width, via dim_of_bit/bitpos_in_dim)
+//             - affine dequant (x = codes * scale + zero_point)
+//             - R @ x rotation (512x512 matrix-vector multiply per token)
+//             - FP8 e4m3 convert
+//             - rope BF16 -> FP8 direct copy
+//             - result written to sK via dense smem staging buffer
+//             Dense path unchanged (bit-exact vs stage-1).
+inline constexpr int64_t kForkBanner = 20260625LL;
 
 inline int64_t fork_banner() { return kForkBanner; }
 
