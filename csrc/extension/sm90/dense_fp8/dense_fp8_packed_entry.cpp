@@ -432,7 +432,7 @@ fwd_kvcache_mla_packed_fp8(
         params.dim_of_bit_ptr =
             reinterpret_cast<int *>(dob.data_ptr());
         params.bitpos_in_dim_ptr =
-            reinterpret_cast<int *>(bpd.data());
+            reinterpret_cast<int *>(bpd.data_ptr());
         // packed_kcache is [N, row_bytes]; page-stride in bytes is
         // page_block_size * row_bytes (rows of the same page are
         // contiguous in row-major layout by construction).
