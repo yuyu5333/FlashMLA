@@ -60,6 +60,46 @@ struct DecodingParams_fp8 {
     int h_h_k_ratio;
     float* __restrict__ descale_q_ptr = nullptr;
     float* __restrict__ descale_k_ptr = nullptr;
+
+    // ------------------------------------------------------------------
+    // [M3.c.4 Stage-1 wiring] packed-FP8 rotated-quant KV cache pointers.
+    //
+    // These four pointers + meta are the **device-side handles** to the
+    // rotated low-precision KV cache (INT2/3/4 affine quant after a
+    // dense orthogonal rotation). They are written by the host entry
+    // `fwd_kvcache_mla_packed_fp8` (see dense_fp8_packed_entry.cpp) when
+    // all four caller tensors are non-None. The current kernel body
+    // (run_mha_fwd_splitkv_mla) **does not yet read these fields**; the
+    // next fork commit will fuse INT-N unpack + R @ x + ×scale + zero
+    // -> FP8 inside the KV-load inner loop, removing the host-side
+    // shadow buffer entirely. Default value is nullptr / 0 so the
+    // pre-existing dense_fp8 path is byte-identical to before.
+    //
+    // Layout convention (matches python/sglang/srt/mem_cache/
+    // rotated_quant_dsv4_memory_pool.py wall-storage layout):
+    //   * packed_kcache : uint8 [num_pages * page_size, row_bytes_nope]
+    //                     (only the nope half; rope half kept BF16 inside
+    //                      the same row, contiguous after nope bytes)
+    //   * scale_kcache  : float32 [num_pages * page_size, qk_nope_head_dim]
+    //                     per-element dequant scale (broadcast against
+    //                     unpacked INT-N value)
+    //   * R_matrix      : float32 [qk_nope_head_dim, qk_nope_head_dim]
+    //                     dense orthogonal rotation applied AFTER unpack
+    //                     + affine (i.e. dequant := R.t() @ (q * scale +
+    //                     zero) under the calibration convention)
+    //   * zero_point    : float32 [qk_nope_head_dim] per-element zero
+    //
+    // packed_row_bytes is the byte-stride of one (page,slot) row inside
+    // packed_kcache; packed_k_batch_stride is the page-stride (i.e.
+    // bytes per page, may include alignment padding).
+    // ------------------------------------------------------------------
+    void*  __restrict__ packed_kcache_ptr     = nullptr;
+    float* __restrict__ scale_kcache_ptr      = nullptr;
+    float* __restrict__ R_matrix_ptr          = nullptr;
+    float* __restrict__ zero_point_ptr        = nullptr;
+    index_t             packed_k_batch_stride = 0;
+    int                 packed_row_bytes      = 0;
+    int                 qk_nope_head_dim      = 0;
 };
 
 static constexpr int TileSchedulerMetaDataSize = 8;

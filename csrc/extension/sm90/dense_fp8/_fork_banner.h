@@ -20,7 +20,11 @@ namespace flashmla_fork {
 
 // bump 这个常量来探针每次 fork-side 改动是否被容器端真实重 build。
 // 数值约定：YYYYMMDD（fork-side 首个 banner commit 日期）。
-inline constexpr int64_t kForkBanner = 20260622LL;
+// 20260622 = stage-0 scaffold (nullptr fallback only).
+// 20260623 = M3.c.4 stage-1 wiring: 4 packed tensors真实写入 DecodingParams_fp8，
+//             kernel 端尚未读取（params struct 加新字段默认 nullptr/0）。
+//             All-4 non-None 时 bit-exact == dense_fp8。
+inline constexpr int64_t kForkBanner = 20260623LL;
 
 inline int64_t fork_banner() { return kForkBanner; }
 
