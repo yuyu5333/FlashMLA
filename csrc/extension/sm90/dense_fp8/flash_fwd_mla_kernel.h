@@ -430,6 +430,73 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                                                               params.q_seq_per_hk - m_block * kBlockM);
 
+        // ============================================================
+        // [M3.c.4 Stage-2 INSERTION CONTRACT — packed-FP8 KV load path]
+        //
+        // **Current state (Stage-1)**: this code path unconditionally reads
+        // a *dense* FP8 K cache (params.k_ptr, shape [N, kHeadDim=576],
+        // dtype float_e4m3_t, row stride params.k_row_stride). The four
+        // packed_*_ptr fields installed by dense_fp8_packed_entry.cpp are
+        // present in `params` but ignored here. As a result, when the host
+        // entry is called with 4 real packed tensors AND a real shadow
+        // dense k_ptr, the kernel produces bit-exact dense_fp8 output and
+        // the shadow buffer is wasted memory — this is what the Stage-1
+        // wiring promises (kernel-side handshake bring-up only).
+        //
+        // **Stage-2 replacement (next FlashMLA fork commit)**: when
+        // params.packed_kcache_ptr != nullptr we should:
+        //
+        //   1. Read packed bytes from gmem:
+        //        uint8_t* pk = params.packed_kcache_ptr
+        //                    + (size_t)cur_block_table * params.packed_k_batch_stride
+        //                    + slot_within_page * params.packed_row_bytes;
+        //      cooperative cp.async into a smem staging buffer.
+        //
+        //   2. Per-element INT-N affine dequant:
+        //        x_fp32[d] = unpack(pk, d) * scale[slot, d] + zero[d]
+        //      where scale = params.scale_kcache_ptr (fp32 [N, qk_nope])
+        //        and zero  = params.zero_point_ptr   (fp32 [qk_nope]).
+        //
+        //   3. Apply rotation R (dense orthogonal, fp32 [qk_nope, qk_nope]):
+        //        y_fp32[d] = sum_k R[d, k] * x_fp32[k]
+        //      R = params.R_matrix_ptr; broadcast across all (bidb, n_block,
+        //      slot). Must be smem-cached and tiled because
+        //      qk_nope_head_dim=448 -> R is 448*448*4B = 786KB > smem cap.
+        //
+        //   4. FP8 convert + concatenate with the rope-half BF16 suffix
+        //      (still living in the same packed row after the nope bytes):
+        //        sK[slot, 0       : qk_nope ]     = (float_e4m3_t) y_fp32
+        //        sK[slot, qk_nope : kHeadDim]     = bf16->fp8(rope_half)
+        //      (kHeadDim = qk_nope + qk_rope = 448 + 64 = 576)
+        //
+        // **Invariants the Stage-2 commit MUST preserve**:
+        //   * Double-buffer sK layout (sK_offset switch in main loop).
+        //   * cp_async fence ordering (cp_async_fence right before main loop).
+        //   * NamedBarriers SReady / TransVReady / SoftmaxReady contract.
+        //   * Same FP8 V transpose path (SmemTransposeFp8_64x64).
+        //   * Branch on params.packed_kcache_ptr == nullptr keeps original
+        //     dense gmem load unchanged (Stage-2 bit-exact == Stage-1 dense
+        //     when packed_kcache_ptr is nullptr).
+        //
+        // **Why not done in this commit**: implementing 1-4 correctly
+        // requires ~500-800 lines of CuTe (R-tile sizing, smem reuse for R,
+        // warp-specialized unpack pipeline) and would couple compile risk
+        // with the Stage-1 bring-up. We split that into the next commit so
+        // Stage-1 host wiring + container rebuild + fork_probe smoke can be
+        // validated end-to-end first.
+        //
+        // **Stage-2 trip-wire is intentionally NOT added here**: a
+        // CUDA-side assert in __device__ code would couple this thin
+        // documentation commit with runtime trap semantics (compute
+        // capability gating, NDEBUG flag uncertainty, kernel launch
+        // failure surfaced as `cudaErrorAssert` on every call). For the
+        // Stage-1 bring-up we want pure dense_fp8 byte-equivalence; any
+        // device-side guard belongs in the Stage-2 commit that actually
+        // implements the branch. The host entry
+        // `fwd_kvcache_mla_packed_fp8` already validates the all-4-None
+        // vs all-4-set partition and rejects the mixed case at the
+        // PyTorch boundary, so a kernel-side guard is redundant for now.
+        // ============================================================
         const index_t row_offset_k = (bidh / params.h_h_k_ratio) * params.k_head_stride;
         Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
