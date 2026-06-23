@@ -326,10 +326,9 @@ fwd_kvcache_mla_packed_fp8(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    caffe2::TypeMeta out_type = torch::kBFloat16;
     at::Tensor out = torch::empty(
         {batch_size, q_seq_per_hk, num_heads, head_size_v_int},
-        opts.dtype(out_type));
+        opts.dtype(at::kBFloat16));
     at::Tensor softmax_lse = torch::empty(
         {batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     PFP8_CHECK_CONTIGUOUS(softmax_lse);
