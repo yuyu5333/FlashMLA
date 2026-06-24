@@ -558,6 +558,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                     // ---- Step 1: dequant 64 tokens into staging buffer ----
+                    // [DIAG] Direct copy from scale_kcache to staging, bypass bit-unpack + R@x
                     for (int tok = 0; tok < TOPK_BLOCK_SIZE; ++tok) {
                         const int token_index = __ldg(indices_base + tok);
                         if (token_index == -1) continue;
@@ -565,50 +566,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
                         const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
 
-                        const uint8_t* pk_row = pk_base
-                            + block_index * pk_block_stride
-                            + rel_idx_in_block * packed_row_bytes;
                         const float* sk_row = sk_base
                             + block_index * page_block_size * qk_nope
                             + rel_idx_in_block * qk_nope;
 
-                        // (a) bit-unpack
                         for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                            s_codes[d] = 0;
+                            staging[tok * qk_nope + d] = static_cast<bf16>(sk_row[d]);
                         }
-                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                        for (int bit_idx = idx_in_warpgroup; bit_idx < row_bits; bit_idx += 128) {
-                            const int d = dob_base[bit_idx];
-                            const int bpos = bpd_base[bit_idx];
-                            const int byte_idx = bit_idx >> 3;
-                            const int bit_in_byte = bit_idx & 7;
-                            if (byte_idx < nope_bytes) {
-                                const uint8_t byte_val = pk_row[byte_idx];
-                                const int bit_val = (byte_val >> bit_in_byte) & 1;
-                                atomicOr(&s_codes[d], bit_val << bpos);
-                            }
-                        }
-                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                        // (b) affine dequant
-                        for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                            s_x[d] = (float)s_codes[d] * sk_row[d] + zp_base[d];
-                        }
-                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                        // (c) R @ x -> bf16 -> staging
-                        for (int j = idx_in_warpgroup; j < qk_nope; j += 128) {
-                            float sum = 0.0f;
-                            const float* R_row = R_base + j * qk_nope;
-                            #pragma unroll 1
-                            for (int d = 0; d < qk_nope; ++d) {
-                                sum += R_row[d] * s_x[d];
-                            }
-                            staging[tok * qk_nope + j] = static_cast<bf16>(sum);
-                        }
-                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                     }
+                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                     // ---- Step 2: copy nope from staging to sK (GMMA layout) ----
                     // Reuse the same thread/token/dim mapping as dense path.
