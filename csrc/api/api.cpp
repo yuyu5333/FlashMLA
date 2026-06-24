@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>  // [Stage-1a fix] required for std::optional<at::Tensor> caster
 
 #include "sparse_fwd.h"
 #include "sparse_decode.h"
