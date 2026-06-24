@@ -266,8 +266,11 @@ sparse_attn_decode_interface(
     const at::Tensor &indices,    // [b, s_q, topk]
     const std::optional<at::Tensor> &topk_length,   // [b, s_q]
     const std::optional<at::Tensor> &attn_sink, // [h_q]
-    std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> &num_splits,                // batch_size + 1
+    // [Stage-1a fix] non-const ref had broken pybind11 std::optional caster
+    // for Python None on torch 2.9.1 build; switch to const-ref + local
+    // mutable copy below to restore None-acceptance (matches 71c7379 behavior).
+    const std::optional<at::Tensor> &tile_scheduler_metadata_in,   // num_sm_parts x (DecodingSchedMetaSize/4)
+    const std::optional<at::Tensor> &num_splits_in,                // batch_size + 1
     const std::optional<at::Tensor> &extra_kv,
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
@@ -294,6 +297,13 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &bitpos_in_dim = std::nullopt
 ) {
     using bf16 = cutlass::bfloat16_t;
+
+    // [Stage-1a fix] Re-introduce mutable local copies so the rest of this
+    // function (which used to take non-const refs) keeps working unchanged.
+    // The function may emplace freshly-allocated tensors below when callers
+    // pass None, then return them out via the std::tuple<...> at the end.
+    std::optional<at::Tensor> tile_scheduler_metadata = tile_scheduler_metadata_in;
+    std::optional<at::Tensor> num_splits             = num_splits_in;
 
     // Check the architecture
     Arch arch = Arch();
