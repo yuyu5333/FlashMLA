@@ -535,7 +535,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                 for (int d = lid; d < qk_nope; d += 128) {
                     s_codes[d] = 0;
                 }
-                __syncthreads();
+                cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
 
                 // Each thread handles a slice of row_bits bits
                 for (int bit_idx = lid; bit_idx < row_bits; bit_idx += 128) {
@@ -549,7 +549,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                         atomicOr(&s_codes[d], bit_val << bpos);
                     }
                 }
-                __syncthreads();
+                cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
 
                 // --- (b) affine dequant: x[d] = codes[d] * scale[d] + zero[d] ---
                 // Also load scale for this token
@@ -558,7 +558,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                     const float z = zp_base[d];
                     s_x[d] = (float)s_codes[d] * s + z;
                 }
-                __syncthreads();
+                cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
 
                 // --- (c) R @ x: each thread owns qk_nope / 128 output dims ---
                 // result[j] = sum_{d=0}^{qk_nope-1} R[j,d] * x[d]
@@ -573,7 +573,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                     // FP8 e4m3 convert and write to dense staging buffer
                     dense_nope[tok * qk_nope + j] = static_cast<Element>(sum);
                 }
-                __syncthreads();
+                cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
             }
 
             // ---- Step 2: write nope half from dense buffer to sK (via tKsK) ----
@@ -607,7 +607,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                     }
                 }
             }
-            __syncthreads();
+            cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
         }
         cute::cp_async_fence();
 
@@ -661,7 +661,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                         for (int d = lid; d < qk_nope; d += 128) {
                             s_codes_pref[d] = 0;
                         }
-                        __syncthreads();
+                        cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
 
                         for (int bit_idx = lid; bit_idx < row_bits; bit_idx += 128) {
                             const int d = dob_base[bit_idx];
@@ -674,7 +674,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                                 atomicOr(&s_codes_pref[d], bit_val << bpos);
                             }
                         }
-                        __syncthreads();
+                        cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
 
                         // (b) affine dequant
                         for (int d = lid; d < qk_nope; d += 128) {
@@ -682,7 +682,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                             const float z = zp_base[d];
                             s_x_pref[d] = (float)s_codes_pref[d] * s + z;
                         }
-                        __syncthreads();
+                        cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
 
                         // (c) R @ x
                         for (int j = lid; j < qk_nope; j += 128) {
@@ -694,7 +694,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                             }
                             dense_nope[tok * qk_nope + j] = static_cast<Element>(sum);
                         }
-                        __syncthreads();
+                        cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
                     }
 
                     // Write nope + rope to sK
@@ -719,7 +719,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                             }
                         }
                     }
-                    __syncthreads();
+                    cutlass::arch::NamedBarrier::sync(128, static_cast<int>(NamedBarriers::PackedKvProducer));
                 }
                 cute::cp_async_fence();
             }

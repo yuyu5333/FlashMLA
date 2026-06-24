@@ -39,7 +39,15 @@ namespace flashmla_fork {
 //             (set by host wrapper from kv-cache shape), the prior arrays
 //             would have produced out-of-bounds atomicOr writes for d>=448.
 //             Dense path still bit-exact unchanged.
-inline constexpr int64_t kForkBanner = 20260626LL;
+// 20260627 = M3.c.4 S2-S2 deadlock fix: replace __syncthreads() with
+//             cutlass NamedBarrier(128, PackedKvProducer=4) inside the
+//             packed-FP8 producer-only KV-load branch. The prior code used
+//             __syncthreads() which deadlocks because this kernel is warp-
+//             specialized: the consumer warp group (tidx<128) does not enter
+//             the producer KV-load branch and would never reach the barrier.
+//             Symptom: packed kernel hung with GPU 0% utilization.
+//             Dense path still bit-exact unchanged.
+inline constexpr int64_t kForkBanner = 20260627LL;
 
 inline int64_t fork_banner() { return kForkBanner; }
 
