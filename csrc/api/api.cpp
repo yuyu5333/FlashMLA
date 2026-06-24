@@ -1,38 +1,25 @@
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>  // [Stage-1a fix] required for std::optional<at::Tensor> caster
 
 #include "sparse_fwd.h"
 #include "sparse_decode.h"
 #include "dense_decode.h"
 #include "dense_fwd.h"
 
-namespace py = pybind11;
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
-    // [Stage-1a fix] Explicit py::arg + py::none() defaults teach pybind11's
-    // std::optional caster to accept Python None for the 13 optional kwargs
-    // (5 original + 2 sched-meta + 6 packed-FP8). Belt-and-braces with the
-    // const-ref change in sparse_decode.h sparse_attn_decode_interface().
-    m.def("sparse_decode_fwd", &sparse_attn_decode_interface,
-          py::arg("q"),
-          py::arg("kv"),
-          py::arg("indices"),
-          py::arg("topk_length")             = py::none(),
-          py::arg("attn_sink")               = py::none(),
-          py::arg("tile_scheduler_metadata") = py::none(),
-          py::arg("num_splits")              = py::none(),
-          py::arg("extra_kv")                = py::none(),
-          py::arg("extra_indices")           = py::none(),
-          py::arg("extra_topk_length")       = py::none(),
-          py::arg("d_v"),
-          py::arg("sm_scale"),
-          py::arg("packed_kcache")           = py::none(),
-          py::arg("scale_kcache")            = py::none(),
-          py::arg("R_matrix")                = py::none(),
-          py::arg("zero_point")              = py::none(),
-          py::arg("dim_of_bit")              = py::none(),
-          py::arg("bitpos_in_dim")           = py::none());
+    // [Stage-1a] sparse_decode_fwd PYBIND. Bare m.def() relies on
+    //   * torch's bundled std::optional<at::Tensor> caster (registered via
+    //     torch/csrc/utils/pybind.h, pulled in transitively by ATen headers)
+    //   * sparse_attn_decode_interface taking const std::optional<at::Tensor>&
+    //     for ALL Tensor optionals (including tile_scheduler_metadata /
+    //     num_splits, switched in this commit) so the caster can bind to
+    //     a temporary built from Python None.
+    // We deliberately do NOT add `#include <pybind11/stl.h>`: stl.h's
+    // generic std::optional<T> caster would recursively look up a caster
+    // for `at::Tensor`, which is not a pybind11-native type, and dispatch
+    // would fail. Torch's specialized caster handles
+    // std::optional<at::Tensor> as a single unit and accepts Python None.
+    m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
     m.def("dense_decode_fwd", &dense_attn_decode_interface);
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
