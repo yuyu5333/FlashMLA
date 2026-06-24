@@ -32,7 +32,14 @@ namespace flashmla_fork {
 //             - rope BF16 -> FP8 direct copy
 //             - result written to sK via dense smem staging buffer
 //             Dense path unchanged (bit-exact vs stage-1).
-inline constexpr int64_t kForkBanner = 20260625LL;
+// 20260626 = M3.c.4 S2-S2 fix: s_codes/s_x smem buffers 448 -> 512 (qk_nope).
+//             Bug discovered during dense fallback verification: the fp32
+//             code/x-stage smem arrays were declared at 448 elements but
+//             FlashMLA k_head_size=576, rope=64, so nope=512. With qk_nope=512
+//             (set by host wrapper from kv-cache shape), the prior arrays
+//             would have produced out-of-bounds atomicOr writes for d>=448.
+//             Dense path still bit-exact unchanged.
+inline constexpr int64_t kForkBanner = 20260626LL;
 
 inline int64_t fork_banner() { return kForkBanner; }
 

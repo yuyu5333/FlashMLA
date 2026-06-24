@@ -489,14 +489,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
             // Pipeline:
             //   1. Bit-unpack (per-channel variable-width, dim_of_bit/bitpos_in_dim)
             //   2. Affine dequant: x = codes * scale + zero_point
-            //   3. R @ x rotation (448x448 matrix-vector per token)
+            //   3. R @ x rotation (qk_nope x qk_nope matrix-vector per token)
             //   4. FP8 e4m3 convert
             //   5. Write nope-half to sK via dense staging buffer
             //   6. Rope half: BF16 -> FP8 direct copy
             //
             // 128 threads (warp group 1) process 64 tokens collaboratively.
             // Tokens are processed one at a time across all threads; each
-            // thread owns 448/128 ≈ 3.5 output dims per token.
+            // thread owns qk_nope/128 = 4 output dims per token (qk_nope=512).
 
             const int qk_nope = params.qk_nope_head_dim;
             const int page_block_size = params.page_block_size;
@@ -513,7 +513,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
             const int* dob_base = params.dim_of_bit_ptr;
             const int* bpd_base = params.bitpos_in_dim_ptr;
 
-            // Dense staging buffer pointer (row-major FP8: 64 x 448)
+            // Dense staging buffer pointer (row-major FP8: 64 x qk_nope, qk_nope=512)
             Element* dense_nope = reinterpret_cast<Element*>(shared_storage.smem_k_dense_nope.data());
             const int packed_row_bytes = params.packed_row_bytes;
             const int nope_bytes = packed_row_bytes - 128;  // rope is 128 bytes at end
@@ -524,9 +524,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
             //   (b) affine + R@x -> result[qk_nope] (each thread owns ~3.5 dims)
             //   (c) FP8 convert -> dense_nope[token][d]
 
-            // Shared mem for per-token intermediate (FP32 codes and x)
-            __shared__ float s_x[448];   // affine-dequantized x (input to R@x)
-            __shared__ int s_codes[448]; // bit-unpacked integer codes
+            // Shared mem for per-token intermediate (FP32 codes and x).
+            // qk_nope max = head_size_k - rope = 576 - 64 = 512.
+            __shared__ float s_x[512];   // affine-dequantized x (input to R@x)
+            __shared__ int s_codes[512]; // bit-unpacked integer codes
 
             for (int tok = 0; tok < 64; ++tok) {
                 // --- (a) bit-unpack: 128 threads share the work ---
@@ -651,8 +652,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Decodin
                     const int packed_row_bytes = params.packed_row_bytes;
                     const int nope_bytes = packed_row_bytes - 128;
 
-                    __shared__ float s_x_pref[448];
-                    __shared__ int s_codes_pref[448];
+                    __shared__ float s_x_pref[512];
+                    __shared__ int s_codes_pref[512];
 
                     #pragma unroll 1
                     for (int tok = 0; tok < 64; ++tok) {
