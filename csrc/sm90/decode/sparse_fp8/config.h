@@ -106,14 +106,6 @@ struct SharedMemoryPlan {
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
-
-    // [M3.c.4 Stage-2] Packed-FP8 nope staging buffer (row-major bf16).
-    // Used by the producer warpgroup when params.packed_kcache_ptr != nullptr:
-    //   1. bit-unpack + affine + R@x -> packed_nope_staging[row][dim]
-    //   2. copy from staging to GMMA-layout sK
-    // Size = TOPK_BLOCK_SIZE (64) * max qk_nope_head_dim (512).
-    // MODEL1 has qk_nope=448 which fits in the same allocation.
-    CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 512];
 };
 
 template<

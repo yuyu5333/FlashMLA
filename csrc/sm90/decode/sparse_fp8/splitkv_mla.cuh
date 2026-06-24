@@ -510,8 +510,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // When packed_kcache_ptr is set, we read packed INT-N rows,
                 // bit-unpack + affine + R@x on the fly, and write BF16 to sK.
                 // Extra KV blocks always use the dense path.
-                const bool use_packed = false;
-                    // !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
+                const bool use_packed =
+                    !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
 
                 if (use_packed) {
                     // ---- Packed FP8 K-load path (S2-S2 fused dequant) ----
