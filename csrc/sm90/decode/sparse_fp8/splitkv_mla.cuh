@@ -538,7 +538,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int* bpd_base = params.bitpos_in_dim_ptr;
                     const int64_t pk_block_stride = params.packed_kv_block_stride;
 
-                    bf16* staging = plan.packed_nope_staging;
+                    bf16* staging = plan.u.packed_nope_staging;
 
                     // Wait for the nope buffer to be available
                     plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
