@@ -1,5 +1,11 @@
+// [Stage-1a] Order matters:
+//   1. <torch/extension.h> first registers torch's specialized
+//      std::optional<at::Tensor> type_caster (and at::Tensor caster).
+//   2. Bare pybind11.h is enough afterwards; do NOT include
+//      <pybind11/stl.h> — its generic std::optional<T> caster would
+//      shadow torch's specialized one and break Tensor binding.
+#include <torch/extension.h>
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>  // [Stage-1a] required for std::optional<at::Tensor> caster
 
 #include "sparse_fwd.h"
 #include "sparse_decode.h"
@@ -10,15 +16,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     namespace py = pybind11;
     // [Stage-1a] sparse_decode_fwd:
-    //   * #include <pybind11/stl.h> registers std::optional<T> caster
+    //   * <torch/extension.h> above registers torch's specialized
+    //     std::optional<at::Tensor> caster (accepts Python None).
     //   * sparse_attn_decode_interface uses const std::optional<at::Tensor>&
-    //   * Trailing 6 packed-FP8 kwargs get py::arg(name)=py::none() so
-    //     pre-Stage-1a callers can keep using 12-arg form.
-    //   * pybind11 forbids mandatory args AFTER default-valued args, so
-    //     we only attach defaults to args 13-18 (after d_v/sm_scale).
-    //     Args 4-10 (the original optional Tensors) stay mandatory; the
-    //     Python wrapper always passes None for them positionally, so
-    //     no default is needed there.
+    //   * Trailing 6 packed-FP8 kwargs get py::none() defaults so
+    //     pre-Stage-1a 12-arg callers still work.
+    //   * pybind11 forbids mandatory args after default-valued args, so
+    //     defaults are only attached to args 13-18 (after d_v/sm_scale).
     m.def("sparse_decode_fwd", &sparse_attn_decode_interface,
           py::arg("q"), py::arg("kv"), py::arg("indices"),
           py::arg("topk_length"),
