@@ -94,18 +94,16 @@ struct SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutK>> k[NUM_K_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
         array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
-        // [M3.c.4 Stage-2] Packed-FP8 nope staging buffer (row-major bf16).
-        // Shares memory with oBuf/oAccumBuf (producer uses it before
-        // consumer starts writing output).
-        // Only the nope half is staged; rope half is copied directly.
-        // Size = TOPK_BLOCK_SIZE (64) * max qk_nope_head_dim (512).
-        CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 512];
     } u;
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
+
+    // [M3.c.4 Stage-2] Packed-FP8 nope staging buffer (half block).
+    // Only 32 tokens to keep smem footprint small; we process in two passes.
+    CUTE_ALIGNAS(128) bf16 packed_nope_staging[32 * 512];
 };
 
 template<
