@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>  // [Stage-1a] required for std::optional<at::Tensor> caster
 
 #include "sparse_fwd.h"
 #include "sparse_decode.h"
@@ -7,18 +8,14 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
-    // [Stage-1a] sparse_decode_fwd PYBIND. Bare m.def() relies on
-    //   * torch's bundled std::optional<at::Tensor> caster (registered via
-    //     torch/csrc/utils/pybind.h, pulled in transitively by ATen headers)
-    //   * sparse_attn_decode_interface taking const std::optional<at::Tensor>&
-    //     for ALL Tensor optionals (including tile_scheduler_metadata /
-    //     num_splits, switched in this commit) so the caster can bind to
-    //     a temporary built from Python None.
-    // We deliberately do NOT add `#include <pybind11/stl.h>`: stl.h's
-    // generic std::optional<T> caster would recursively look up a caster
-    // for `at::Tensor`, which is not a pybind11-native type, and dispatch
-    // would fail. Torch's specialized caster handles
-    // std::optional<at::Tensor> as a single unit and accepts Python None.
+    // [Stage-1a] sparse_decode_fwd: bare m.def() + #include <pybind11/stl.h>
+    // pybind11's stl.h registers the std::optional<T> caster. Combined with
+    // sparse_attn_decode_interface taking const std::optional<at::Tensor>&
+    // (changed from non-const ref earlier in this branch), Python None
+    // correctly binds via the caster's empty-optional path.
+    // No py::arg defaults: pybind11 forbids mandatory args after default-
+    // valued args, and the Python wrapper always passes all 18 args
+    // positionally, so defaults are unnecessary.
     m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
     m.def("dense_decode_fwd", &dense_attn_decode_interface);
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
