@@ -506,6 +506,174 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 [[maybe_unused]] int rel_block_idx = IS_EXTRA_BLOCK ? (block_idx - args.num_orig_kv_blocks) : block_idx;
                 transac_bar_t* peer_bar_k_remote_ready = get_peer_addr(&(plan.bar_k_remote_ready[buf_idx]));
 
+                // [M3.c.4 Stage-2] Packed-FP8 fused-dequant path.
+                // When packed_kcache_ptr is set, we read packed INT-N rows,
+                // bit-unpack + affine + R@x on the fly, and write BF16 to sK.
+                // Extra KV blocks always use the dense path.
+                const bool use_packed =
+                    !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
+
+                if (use_packed) {
+                    // ---- Packed FP8 K-load path (S2-S2 fused dequant) ----
+                    //
+                    // Pipeline per token:
+                    //   1. bit-unpack (variable-width via dim_of_bit/bitpos_in_dim)
+                    //   2. affine dequant: x = codes * scale + zero_point
+                    //   3. R @ x rotation (full matrix-vector)
+                    //   4. bf16 -> packed_nope_staging (row-major)
+                    // Then copy from staging to GMMA-layout sK.
+                    //
+                    // 128 threads collaborate on each token; iterate over 64 tokens.
+
+                    const int qk_nope = params.qk_nope_head_dim;
+                    const int row_bits = params.row_bits;
+                    const int packed_row_bytes = params.packed_row_bytes;
+                    const int nope_bytes = packed_row_bytes - 128;  // rope = 64 bf16 = 128 bytes
+
+                    const uint8_t* pk_base = reinterpret_cast<const uint8_t*>(params.packed_kcache_ptr);
+                    const float* sk_base = params.scale_kcache_ptr;
+                    const float* R_base = params.R_matrix_ptr;
+                    const float* zp_base = params.zero_point_ptr;
+                    const int* dob_base = params.dim_of_bit_ptr;
+                    const int* bpd_base = params.bitpos_in_dim_ptr;
+                    const int64_t pk_block_stride = params.packed_kv_block_stride;
+
+                    bf16* staging = plan.packed_nope_staging;
+
+                    // Wait for the nope buffer to be available
+                    plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
+
+                    if (CLUSTER_SIZE == 2 && idx_in_warpgroup == 0) {
+                        plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
+                    }
+
+                    // Shared mem for per-token intermediate (FP32)
+                    __shared__ float s_x[512];
+                    __shared__ int s_codes[512];
+
+                    // Initialize staging to 0 (covers invalid tokens)
+                    for (int i = idx_in_warpgroup; i < TOPK_BLOCK_SIZE * qk_nope; i += 128) {
+                        staging[i] = bf16(0.0f);
+                    }
+                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                    // ---- Step 1: dequant 64 tokens into staging buffer ----
+                    for (int tok = 0; tok < TOPK_BLOCK_SIZE; ++tok) {
+                        const int token_index = __ldg(indices_base + tok);
+                        if (token_index == -1) continue;
+
+                        const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
+                        const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
+
+                        const uint8_t* pk_row = pk_base
+                            + block_index * pk_block_stride
+                            + rel_idx_in_block * packed_row_bytes;
+                        const float* sk_row = sk_base
+                            + block_index * page_block_size * qk_nope
+                            + rel_idx_in_block * qk_nope;
+
+                        // (a) bit-unpack
+                        for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                            s_codes[d] = 0;
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                        for (int bit_idx = idx_in_warpgroup; bit_idx < row_bits; bit_idx += 128) {
+                            const int d = dob_base[bit_idx];
+                            const int bpos = bpd_base[bit_idx];
+                            const int byte_idx = bit_idx >> 3;
+                            const int bit_in_byte = bit_idx & 7;
+                            if (byte_idx < nope_bytes) {
+                                const uint8_t byte_val = pk_row[byte_idx];
+                                const int bit_val = (byte_val >> bit_in_byte) & 1;
+                                atomicOr(&s_codes[d], bit_val << bpos);
+                            }
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                        // (b) affine dequant
+                        for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                            s_x[d] = (float)s_codes[d] * sk_row[d] + zp_base[d];
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                        // (c) R @ x -> bf16 -> staging
+                        for (int j = idx_in_warpgroup; j < qk_nope; j += 128) {
+                            float sum = 0.0f;
+                            const float* R_row = R_base + j * qk_nope;
+                            #pragma unroll 1
+                            for (int d = 0; d < qk_nope; ++d) {
+                                sum += R_row[d] * s_x[d];
+                            }
+                            staging[tok * qk_nope + j] = static_cast<bf16>(sum);
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                    }
+
+                    // ---- Step 2: copy nope from staging to sK (GMMA layout) ----
+                    // Reuse the same thread/token/dim mapping as dense path.
+                    CUTE_UNROLL
+                    for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                        int my_token_idx = my_token_idx_base + round*NUM_TOKENS_PER_ROUND;
+                        bf16* sK_nope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*16)*TOPK_BLOCK_SIZE;
+                        bf16* sK_nope_peer_base = get_peer_addr(sK_nope_base);
+
+                        CUTE_UNROLL
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
+                            auto copy_bf16x8 = [&](int offset) {
+                                int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
+                                int dim = (lane_idx/8)*16 + dim_idx*64 + offset;
+                                bf16x8 val = *reinterpret_cast<bf16x8*>(&staging[(idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx) * qk_nope + dim]);
+                                *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&val;
+                                if constexpr (CLUSTER_SIZE == 2) {
+                                    st_async_128b(sK_nope_peer_base + smem_offset, val, peer_bar_k_remote_ready);
+                                }
+                            };
+                            copy_bf16x8(0);
+                            copy_bf16x8(8);
+                        }
+
+                        // ---- Rope half: BF16 direct copy from packed row ----
+                        bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
+                        bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
+
+                        const int token_idx_abs = idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx;
+                        const int token_index = __ldg(indices_base + token_idx_abs);
+
+                        if (token_index != -1) {
+                            const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
+                            const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
+                            const uint8_t* pk_row = pk_base
+                                + block_index * pk_block_stride
+                                + rel_idx_in_block * packed_row_bytes;
+                            const bf16* rope_bf16 = reinterpret_cast<const bf16*>(pk_row + nope_bytes);
+
+                            CUTE_UNROLL
+                            for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
+                                bf16x8 val = *reinterpret_cast<const bf16x8*>(&rope_bf16[(lane_idx/8)*8 + dim_idx*32]);
+                                int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
+                                *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&val;
+                                if constexpr (CLUSTER_SIZE == 2) {
+                                    st_async_128b(sK_rope_peer_base + smem_offset, val, peer_bar_k_remote_ready);
+                                }
+                            }
+                        } else {
+                            CUTE_UNROLL
+                            for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
+                                bf16x8 val;
+                                *(uint128_t*)&val = uint128_t();
+                                int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
+                                *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&val;
+                                if constexpr (CLUSTER_SIZE == 2) {
+                                    st_async_128b(sK_rope_peer_base + smem_offset, val, peer_bar_k_remote_ready);
+                                }
+                            }
+                        }
+                    }
+
+                    fence_view_async_shared();
+                } else {
+                    // ---- Original dense FP8 K-load path ----
                 CUTE_UNROLL
                 for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
                     int my_token_idx = my_token_idx_base + round*NUM_TOKENS_PER_ROUND;
@@ -624,6 +792,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 }
 
                 fence_view_async_shared();
+                }  // end if (use_packed) / else
 
                 if (idx_in_warpgroup < 32) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
