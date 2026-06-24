@@ -180,6 +180,85 @@ protected:
     }
 };
 
+// ---------------------------------------------------------------------------
+// [M3.c.4 Stage-1a] sparse-path packed buffer validator.
+//
+// Mirrors validate_packed_buffers() in csrc/extension/sm90/dense_fp8/
+// dense_fp8_packed_entry.cpp but adapted to sparse path's kv layout
+// (`kv` is [num_blocks, page_block_size, h_kv=1, bytes_per_token]).
+// Stage-1a: kernel does NOT yet read these fields. Buffer wiring here
+// only ensures call-site ABI is stable and `params.*_ptr` slots are
+// populated for the next-stage S2-S2 fused-dequant kernel.
+// ---------------------------------------------------------------------------
+inline void sparse_validate_packed_buffers(
+    const at::Tensor &packed_kcache,
+    const at::Tensor &scale_kcache,
+    const at::Tensor &R_matrix,
+    const at::Tensor &zero_point,
+    int kv_num_rows,
+    int *out_qk_nope_head_dim,
+    int *out_packed_row_bytes
+) {
+    KU_CHECK_DEVICE(packed_kcache);
+    KU_CHECK_DEVICE(scale_kcache);
+    KU_CHECK_DEVICE(R_matrix);
+    KU_CHECK_DEVICE(zero_point);
+
+    TORCH_CHECK(packed_kcache.dtype() == at::kByte,
+        "packed_kcache must be uint8");
+    TORCH_CHECK(scale_kcache.dtype() == at::kFloat,
+        "scale_kcache must be float32");
+    TORCH_CHECK(R_matrix.dtype() == at::kFloat,
+        "R_matrix must be float32");
+    TORCH_CHECK(zero_point.dtype() == at::kFloat,
+        "zero_point must be float32");
+
+    TORCH_CHECK(packed_kcache.stride(-1) == 1,
+        "packed_kcache must have contiguous last dim");
+    KU_CHECK_CONTIGUOUS(scale_kcache);
+    KU_CHECK_CONTIGUOUS(R_matrix);
+    KU_CHECK_CONTIGUOUS(zero_point);
+
+    TORCH_CHECK(R_matrix.dim() == 2,
+        "R_matrix must be rank-2, got ", R_matrix.dim());
+    const auto R0 = R_matrix.size(0);
+    const auto R1 = R_matrix.size(1);
+    TORCH_CHECK(R0 == R1,
+        "R_matrix must be square, got [", R0, ", ", R1, "]");
+    const int qk_nope = static_cast<int>(R0);
+    TORCH_CHECK(qk_nope > 0 && qk_nope % 32 == 0,
+        "qk_nope_head_dim must be positive multiple of 32, got ", qk_nope);
+
+    TORCH_CHECK(zero_point.dim() == 1 && zero_point.size(0) == qk_nope,
+        "zero_point must be [qk_nope_head_dim], got [",
+        zero_point.sizes(), "]");
+
+    TORCH_CHECK(packed_kcache.dim() == 2,
+        "packed_kcache must be rank-2 [num_rows, row_bytes], got ",
+        packed_kcache.dim());
+    const auto pk_rows = packed_kcache.size(0);
+    const auto pk_cols = packed_kcache.size(1);
+    TORCH_CHECK(pk_rows == kv_num_rows,
+        "packed_kcache row count ", pk_rows, " must equal kv num_rows ",
+        kv_num_rows, " (= num_blocks * page_block_size)");
+    TORCH_CHECK(pk_cols > 0 && pk_cols <= qk_nope,
+        "packed_kcache row_bytes ", pk_cols,
+        " must be in (0, qk_nope_head_dim=", qk_nope, "]");
+
+    TORCH_CHECK(scale_kcache.dim() == 2,
+        "scale_kcache must be rank-2 [num_rows, qk_nope], got ",
+        scale_kcache.dim());
+    TORCH_CHECK(scale_kcache.size(0) == kv_num_rows,
+        "scale_kcache row count ", scale_kcache.size(0),
+        " must equal kv num_rows ", kv_num_rows);
+    TORCH_CHECK(scale_kcache.size(1) == qk_nope,
+        "scale_kcache col count ", scale_kcache.size(1),
+        " must equal qk_nope_head_dim ", qk_nope);
+
+    *out_qk_nope_head_dim = qk_nope;
+    *out_packed_row_bytes = static_cast<int>(pk_cols);
+}
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
@@ -193,7 +272,26 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
     int d_v,
-    float sm_scale
+    float sm_scale,
+    // ---- [M3.c.4 Stage-1a] packed-FP8 device-side wiring (default None). ----
+    // All six optional. Mode selection:
+    //   * all-6 None     -> bit-exact pre-stage-1a behavior (kernel ignores
+    //                       packed fields; SparseAttnDecodeParams defaults
+    //                       leave them nullptr/0).
+    //   * all-6 non-None -> Stage-1a wiring path: shape/dtype validate +
+    //                       write pointers into params.* slots; the
+    //                       current sparse_fp8 kernel still doesn't read
+    //                       them, so output is still bit-exact vs the
+    //                       all-None path. Stage-2 will swap the K-tile
+    //                       cp.async with fused unpack+R@x+FP8 convert
+    //                       and start consuming these fields.
+    //   * mixed          -> hard fail (TORCH_CHECK).
+    const std::optional<at::Tensor> &packed_kcache = std::nullopt,
+    const std::optional<at::Tensor> &scale_kcache  = std::nullopt,
+    const std::optional<at::Tensor> &R_matrix      = std::nullopt,
+    const std::optional<at::Tensor> &zero_point    = std::nullopt,
+    const std::optional<at::Tensor> &dim_of_bit    = std::nullopt,
+    const std::optional<at::Tensor> &bitpos_in_dim = std::nullopt
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -464,6 +562,77 @@ sparse_attn_decode_interface(
     params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
     params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
     params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
+
+    // ---- [M3.c.4 Stage-1a] packed-FP8 wiring (mode selection). ----
+    // Mirror dense_fp8_packed_entry.cpp fork pattern. Stage-1a: kernel
+    // does not yet consume these fields, so byte-identical regression
+    // vs pre-Stage-1a is asserted by the all-None branch (which is the
+    // path covered by tests/test_flash_mla_dense_decoding.py sparse
+    // smokes today). Stage-2 will swap the K-tile cp.async to read
+    // these fields and emit FP8 on the fly.
+    {
+        const int num_packed_present =
+            (packed_kcache.has_value() ? 1 : 0) +
+            (scale_kcache.has_value()  ? 1 : 0) +
+            (R_matrix.has_value()      ? 1 : 0) +
+            (zero_point.has_value()    ? 1 : 0) +
+            (dim_of_bit.has_value()    ? 1 : 0) +
+            (bitpos_in_dim.has_value() ? 1 : 0);
+        TORCH_CHECK(num_packed_present == 0 || num_packed_present == 6,
+            "sparse_attn_decode_interface: packed-FP8 path requires either "
+            "all six of (packed_kcache, scale_kcache, R_matrix, zero_point, "
+            "dim_of_bit, bitpos_in_dim) to be None or all six non-None. "
+            "Got non-None count=", num_packed_present);
+
+        if (num_packed_present == 6) {
+            const at::Tensor &pk = packed_kcache.value();
+            const at::Tensor &sk = scale_kcache.value();
+            const at::Tensor &Rm = R_matrix.value();
+            const at::Tensor &zp = zero_point.value();
+            const at::Tensor &dob = dim_of_bit.value();
+            const at::Tensor &bpd = bitpos_in_dim.value();
+
+            int qk_nope_head_dim_val = 0;
+            int packed_row_bytes_val = 0;
+            const int kv_num_rows = num_blocks * page_block_size;
+            sparse_validate_packed_buffers(
+                pk, sk, Rm, zp,
+                kv_num_rows,
+                &qk_nope_head_dim_val,
+                &packed_row_bytes_val);
+
+            KU_CHECK_DEVICE(dob);
+            KU_CHECK_DEVICE(bpd);
+            KU_CHECK_CONTIGUOUS(dob);
+            KU_CHECK_CONTIGUOUS(bpd);
+            TORCH_CHECK(dob.dtype() == at::kInt, "dim_of_bit must be int32");
+            TORCH_CHECK(bpd.dtype() == at::kInt, "bitpos_in_dim must be int32");
+            TORCH_CHECK(dob.dim() == 1 && bpd.dim() == 1,
+                "dim_of_bit and bitpos_in_dim must be rank-1");
+            TORCH_CHECK(dob.size(0) == bpd.size(0),
+                "dim_of_bit and bitpos_in_dim must have same length");
+            const int row_bits_val = static_cast<int>(dob.size(0));
+            TORCH_CHECK(row_bits_val > 0, "row_bits must be positive");
+
+            params.packed_kcache_ptr = pk.data_ptr();
+            params.scale_kcache_ptr =
+                reinterpret_cast<float *>(sk.data_ptr());
+            params.R_matrix_ptr =
+                reinterpret_cast<float *>(Rm.data_ptr());
+            params.zero_point_ptr =
+                reinterpret_cast<float *>(zp.data_ptr());
+            params.dim_of_bit_ptr =
+                reinterpret_cast<int *>(dob.data_ptr());
+            params.bitpos_in_dim_ptr =
+                reinterpret_cast<int *>(bpd.data_ptr());
+            params.packed_row_bytes = packed_row_bytes_val;
+            params.packed_kv_block_stride =
+                static_cast<int64_t>(page_block_size) *
+                static_cast<int64_t>(packed_row_bytes_val);
+            params.qk_nope_head_dim = qk_nope_head_dim_val;
+            params.row_bits = row_bits_val;
+        }
+    }
 
     impl->run(params, features);
     

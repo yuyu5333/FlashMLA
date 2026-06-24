@@ -100,6 +100,47 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
     int num_sm_parts;
+
+    // ------------------------------------------------------------------
+    // [M3.c.4 Stage-1a wiring] packed-FP8 rotated-quant KV cache pointers
+    // for the sparse decode path (mirrors DecodingParams_fp8 in
+    // csrc/extension/sm90/dense_fp8/flash_mla.h).
+    //
+    // These six pointers + meta are the **device-side handles** to the
+    // rotated low-precision KV cache (INT2/3/4 affine quant after a
+    // dense orthogonal rotation) for the sparse path. They are written
+    // by the host entry `sparse_attn_decode_interface` when all six
+    // caller tensors are non-None. The current sparse kernels do
+    // **not yet read these fields**; the next fork commit will fuse
+    // INT-N unpack + R @ x + ×scale + zero -> FP8 inside the K-tile
+    // load, removing the host-side shadow buffer entirely. Default
+    // values are nullptr / 0 so the pre-existing sparse path is
+    // byte-identical to before.
+    //
+    // Layout convention (matches python/sglang/srt/mem_cache/
+    // rotated_quant_dsv4_memory_pool.py wall-storage layout):
+    //   * packed_kcache : uint8 [num_pages * page_size, row_bytes_nope]
+    //                     (only the nope half; rope half kept BF16
+    //                      contiguous after nope bytes)
+    //   * scale_kcache  : float32 [num_pages * page_size, qk_nope_head_dim]
+    //                     per-element dequant scale
+    //   * R_matrix      : float32 [qk_nope_head_dim, qk_nope_head_dim]
+    //                     dense orthogonal rotation
+    //   * zero_point    : float32 [qk_nope_head_dim] per-element zero
+    // dim_of_bit / bitpos_in_dim: per-config bit-packing metadata
+    // (length = row_bits = sum(bits[d] for d in 0..qk_nope-1)),
+    // per-layer constants.
+    // ------------------------------------------------------------------
+    void*  __restrict__ packed_kcache_ptr     = nullptr;
+    float* __restrict__ scale_kcache_ptr      = nullptr;
+    float* __restrict__ R_matrix_ptr          = nullptr;
+    float* __restrict__ zero_point_ptr        = nullptr;
+    int*   __restrict__ dim_of_bit_ptr        = nullptr;
+    int*   __restrict__ bitpos_in_dim_ptr     = nullptr;
+    int64_t             packed_kv_block_stride = 0;
+    int                 packed_row_bytes      = 0;
+    int                 qk_nope_head_dim      = 0;
+    int                 row_bits              = 0;
 };
 
 struct CombineParams {

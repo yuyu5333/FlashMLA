@@ -66,7 +66,17 @@ def flash_mla_with_kvcache(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None
+    extra_topk_length: Optional[torch.Tensor] = None,
+    # ---- [M3.c.4 Stage-1a] sparse-path packed-FP8 wiring (default None). ----
+    # All-six None -> bit-exact pre-stage-1a; all-six non-None -> Stage-1a
+    # wiring (kernel still ignores fields; output bit-exact). Stage-2 will
+    # consume these inside sm90 sparse_fp8 splitkv K-tile load.
+    packed_kcache: Optional[torch.Tensor] = None,
+    scale_kcache: Optional[torch.Tensor] = None,
+    R_matrix: Optional[torch.Tensor] = None,
+    zero_point: Optional[torch.Tensor] = None,
+    dim_of_bit: Optional[torch.Tensor] = None,
+    bitpos_in_dim: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -152,11 +162,16 @@ def flash_mla_with_kvcache(
         # Sparse attention
         assert not causal, "causal must be False when sparse attention is enabled"
         assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
+        # [M3.c.4 Stage-1a] always pass 6 packed kwargs through; C++ side
+        # accepts std::optional<at::Tensor> and runs all-None bit-exact
+        # path when all six are None.
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale
+            head_dim_v, softmax_scale,
+            packed_kcache, scale_kcache, R_matrix, zero_point,
+            dim_of_bit, bitpos_in_dim,
         )
     else:
         # Dense attention
