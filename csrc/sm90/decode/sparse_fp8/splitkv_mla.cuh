@@ -596,9 +596,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int dim_base = dim_block * 64;
 
                         // ---- Step 1: fill staging with bit-unpack + affine dequant ----
-                        // staging[t, d] = code[t, dim_base+d] * scale_kcache[t, dim_base+d] + zero_point[dim_base+d]
-                        // Identity-calib assumption: 1 bit per dim, dim_of_bit[i]=i, bitpos_in_dim[i]=0.
-                        // (R rotation is currently identity; general R support is a follow-up.)
+                        // Variable-width bit layout described by row_bits global bit slots:
+                        //   bit i lives at byte (i/8), bit (i%8) of a packed row, and
+                        //   contributes value (1 << bitpos_in_dim[i]) to dim_of_bit[i].
+                        //
+                        // For each (token, dim) in this dim-block we:
+                        //   code[t, d] = sum_{i : dim_of_bit[i] == d} bit(i) << bitpos_in_dim[i]
+                        //   staging[t, d] = code * scale_kcache[t, d] + zero_point[d]
+                        //
+                        // (R rotation is currently identity; general R is a follow-up.)
                         for (int entry = idx_in_warpgroup; entry < TOPK_BLOCK_SIZE * 64; entry += 128) {
                             const int t = entry / 64;
                             const int d_in_block = entry % 64;
@@ -620,10 +626,19 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const uint8_t* pk_row = pk_base
                                     + block_index * pk_block_stride
                                     + rel_idx_in_block * packed_row_bytes;
-                                // 1 bit/dim identity layout: bit d_global lives in byte d_global/8.
-                                uint8_t b = pk_row[d_global >> 3];
-                                int code = (b >> (d_global & 7)) & 1;
-                                // scale_kcache is [num_rows, qk_nope]; row = token_index (= block*page_block_size + rel).
+
+                                // Accumulate code from all bit slots that map to d_global.
+                                // For typical small row_bits (e.g. <= 8x qk_nope) and per-dim
+                                // bit budgets <= 4, this is cheap.
+                                int code = 0;
+                                for (int i = 0; i < row_bits; ++i) {
+                                    if (__ldg(dob_base + i) == d_global) {
+                                        const int byte_off = i >> 3;
+                                        const int bit_off = i & 7;
+                                        const int bit = (pk_row[byte_off] >> bit_off) & 1;
+                                        code |= bit << __ldg(bpd_base + i);
+                                    }
+                                }
                                 float scale = sk_base[token_index * qk_nope + d_global];
                                 float zp = zp_base[d_global];
                                 result = bf16((float)code * scale + zp);
