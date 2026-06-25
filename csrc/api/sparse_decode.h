@@ -241,19 +241,32 @@ inline void sparse_validate_packed_buffers(
     TORCH_CHECK(pk_rows == kv_num_rows,
         "packed_kcache row count ", pk_rows, " must equal kv num_rows ",
         kv_num_rows, " (= num_blocks * page_block_size)");
-    TORCH_CHECK(pk_cols > 0 && pk_cols <= qk_nope,
+    TORCH_CHECK(pk_cols > 0 && pk_cols <= 2 * qk_nope,
         "packed_kcache row_bytes ", pk_cols,
-        " must be in (0, qk_nope_head_dim=", qk_nope, "]");
+        " must be in (0, 2*qk_nope_head_dim=", 2 * qk_nope,
+        "]  (packed_row_bytes = row_bytes_nope + rope_bytes(128))");
 
-    TORCH_CHECK(scale_kcache.dim() == 2,
-        "scale_kcache must be rank-2 [num_rows, qk_nope], got ",
-        scale_kcache.dim());
-    TORCH_CHECK(scale_kcache.size(0) == kv_num_rows,
-        "scale_kcache row count ", scale_kcache.size(0),
-        " must equal kv num_rows ", kv_num_rows);
-    TORCH_CHECK(scale_kcache.size(1) == qk_nope,
-        "scale_kcache col count ", scale_kcache.size(1),
-        " must equal qk_nope_head_dim ", qk_nope);
+    // scale_kcache: accept both rank-1 [qk_nope] (per-dim affine, what
+    // M3.c.* calib actually produces) and the legacy rank-2
+    // [num_rows, qk_nope] (per-row scale). The kernel currently reads
+    // sk_base[d_global] only, so the rank-1 path is what we actually
+    // exercise; the rank-2 path is kept for backward-compat tests that
+    // may pre-stage [num_rows, qk_nope] tensors.
+    if (scale_kcache.dim() == 1) {
+        TORCH_CHECK(scale_kcache.size(0) == qk_nope,
+            "scale_kcache rank-1 length ", scale_kcache.size(0),
+            " must equal qk_nope_head_dim ", qk_nope);
+    } else {
+        TORCH_CHECK(scale_kcache.dim() == 2,
+            "scale_kcache must be rank-1 [qk_nope] or rank-2 "
+            "[num_rows, qk_nope], got rank ", scale_kcache.dim());
+        TORCH_CHECK(scale_kcache.size(0) == kv_num_rows,
+            "scale_kcache row count ", scale_kcache.size(0),
+            " must equal kv num_rows ", kv_num_rows);
+        TORCH_CHECK(scale_kcache.size(1) == qk_nope,
+            "scale_kcache col count ", scale_kcache.size(1),
+            " must equal qk_nope_head_dim ", qk_nope);
+    }
 
     *out_qk_nope_head_dim = qk_nope;
     *out_packed_row_bytes = static_cast<int>(pk_cols);

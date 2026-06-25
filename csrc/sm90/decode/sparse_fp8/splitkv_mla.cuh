@@ -639,7 +639,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         code |= bit << __ldg(bpd_base + i);
                                     }
                                 }
-                                float scale = sk_base[token_index * qk_nope + d_global];
+                                // M3.c.* calib is per-dim affine: scale/zero have shape [qk_nope].
+                                // sk_base is therefore a length-qk_nope float buffer (NOT a
+                                // [num_rows, qk_nope] table). Index by d_global only.
+                                float scale = sk_base[d_global];
                                 float zp = zp_base[d_global];
                                 result = bf16((float)code * scale + zp);
                             }
