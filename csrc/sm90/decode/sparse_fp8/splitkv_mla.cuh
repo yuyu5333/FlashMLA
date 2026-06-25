@@ -518,7 +518,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     //
                     // Process in 7 dim-blocks (448 / 64 = 7).
                     // Per block (64 dims):
-                    //   1. compute dequant for all 64 tokens → staging (8KB smem in union)
+                    //   1. compute dequant for all 64 tokens -> staging (8KB smem in union)
                     //   2. each thread reads its own token's 64 dims into registers
                     //   3. named barrier sync (staging no longer needed)
                     //   4. each thread writes regs to GMMA-layout sK
@@ -594,13 +594,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     // ---- Now process nope half in 7 dim-blocks ----
                     // Each thread handles dims (lane_idx/8)*16 .. (lane_idx/8)*16+15
-                    // within each 64-dim block (= 16 dims = 2× bf16x8).
+                    // within each 64-dim block (= 16 dims = 2x bf16x8).
                     CUTE_UNROLL
                     for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
                         const int dim_base = dim_block * 64;
 
                         // ---- Step 1: fill staging with this dim-block (64 dims x 64 tokens) ----
-                        // [DIAG-zeros] Write zeros only — bypass scale_kcache entirely
+                        // [DIAG-zeros] Write zeros only, bypass scale_kcache entirely
                         for (int i = idx_in_warpgroup; i < TOPK_BLOCK_SIZE * 64; i += 128) {
                             staging[i] = bf16(0.0f);
                         }
