@@ -547,10 +547,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
                     }
 
-                    // Shared mem for per-token intermediate (FP32)
-                    __shared__ float s_x[512];
-                    __shared__ int s_codes[512];
-
                     // ---- First, copy rope half directly (no staging needed) ----
                     CUTE_UNROLL
                     for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
