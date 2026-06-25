@@ -588,28 +588,38 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }
                     }
 
-                    // ---- Now process nope half in 7 dim-blocks ----
-                    // Each thread handles dims (lane_idx/8)*16 .. (lane_idx/8)*16+15
-                    // within each 64-dim block (= 16 dims = 2x bf16x8).
+                    // [M3.c.4 Stage-5 Bug-2 fix] Per-token full unpack + affine
+                    // + R@x dequant.
+                    //
+                    // Calibration convention (build_rotated_kv_calib.py +
+                    // rotated_quant_dsv4_kernels.py):
+                    //   store:   K_rot = nope @ R; codes = round((K_rot - zero) / scale)
+                    //   load:    nope  = (codes * scale + zero) @ R.t()
+                    // With R row-major in memory, the inverse rotation produces
+                    //   result[j] = sum_d R[j, d] * x[d]
+                    // where x[d] = codes[d] * scale[d] + zero[d]. This is exactly
+                    // what dense_fp8 fork's flash_fwd_mla_kernel.h does.
+                    //
+                    // s_codes / s_x are token-scoped scratchpads shared by the
+                    // 128 producer-WG threads. qk_nope <= 512 (V32: 512, MODEL1:
+                    // 448); we size to 576 to stay above HEAD_DIM_K.
+                    __shared__ int s_codes[576];
+                    __shared__ float s_x[576];
+
                     CUTE_UNROLL
                     for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
                         const int dim_base = dim_block * 64;
 
-                        // ---- Step 1: fill staging with bit-unpack + affine dequant ----
+                        // ---- Step 1: per-token unpack + affine + R@x ----
                         // Variable-width bit layout described by row_bits global bit slots:
                         //   bit i lives at byte (i/8), bit (i%8) of a packed row, and
                         //   contributes value (1 << bitpos_in_dim[i]) to dim_of_bit[i].
                         //
-                        // For each (token, dim) in this dim-block we:
-                        //   code[t, d] = sum_{i : dim_of_bit[i] == d} bit(i) << bitpos_in_dim[i]
-                        //   staging[t, d] = code * scale_kcache[t, d] + zero_point[d]
-                        //
-                        // (R rotation is currently identity; general R is a follow-up.)
-                        for (int entry = idx_in_warpgroup; entry < TOPK_BLOCK_SIZE * 64; entry += 128) {
-                            const int t = entry / 64;
-                            const int d_in_block = entry % 64;
-                            const int d_global = dim_base + d_in_block;
-
+                        // For each token t we:
+                        //   (a) s_codes[d] = sum_{i : dim_of_bit[i] == d} bit(i) << bitpos_in_dim[i]
+                        //   (b) s_x[d]     = s_codes[d] * scale[d] + zero[d]
+                        //   (c) staging[t, d_in_block] = sum_d R[(dim_base+d_in_block), d] * s_x[d]
+                        for (int t = 0; t < TOPK_BLOCK_SIZE; ++t) {
                             int token_index = __ldg(indices_base + t);
                             bool out_of_range = false;
                             if constexpr (MODEL_TYPE == ModelType::MODEL1) {
@@ -617,36 +627,65 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     out_of_range = true;
                                 }
                             }
-                            bf16 result;
-                            if (token_index == -1 || out_of_range) {
-                                result = bf16(0.0f);
-                            } else {
+                            const bool invalid = (token_index == -1) || out_of_range;
+
+                            if (!invalid) {
                                 const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
                                 const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
                                 const uint8_t* pk_row = pk_base
                                     + block_index * pk_block_stride
                                     + rel_idx_in_block * packed_row_bytes;
 
-                                // Accumulate code from all bit slots that map to d_global.
-                                // For typical small row_bits (e.g. <= 8x qk_nope) and per-dim
-                                // bit budgets <= 4, this is cheap.
-                                int code = 0;
-                                for (int i = 0; i < row_bits; ++i) {
-                                    if (__ldg(dob_base + i) == d_global) {
-                                        const int byte_off = i >> 3;
-                                        const int bit_off = i & 7;
-                                        const int bit = (pk_row[byte_off] >> bit_off) & 1;
-                                        code |= bit << __ldg(bpd_base + i);
+                                // (a-1) init s_codes
+                                for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                    s_codes[d] = 0;
+                                }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                // (a-2) atomicOr each bit slot into its dim
+                                for (int bit_idx = idx_in_warpgroup; bit_idx < row_bits; bit_idx += 128) {
+                                    const int d = __ldg(dob_base + bit_idx);
+                                    const int bpos = __ldg(bpd_base + bit_idx);
+                                    const int byte_off = bit_idx >> 3;
+                                    const int bit_off = bit_idx & 7;
+                                    const int bit_v = (pk_row[byte_off] >> bit_off) & 1;
+                                    if (bit_v) {
+                                        atomicOr(&s_codes[d], 1 << bpos);
                                     }
                                 }
-                                // M3.c.* calib is per-dim affine: scale/zero have shape [qk_nope].
-                                // sk_base is therefore a length-qk_nope float buffer (NOT a
-                                // [num_rows, qk_nope] table). Index by d_global only.
-                                float scale = sk_base[d_global];
-                                float zp = zp_base[d_global];
-                                result = bf16((float)code * scale + zp);
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                // (b) affine dequant: s_x[d] = code * scale[d] + zero[d]
+                                // sk_base / zp_base are per-dim length-qk_nope.
+                                for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                    s_x[d] = (float)s_codes[d] * sk_base[d] + zp_base[d];
+                                }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                // (c) R @ s_x for this dim_block's 64 outputs.
+                                // 128 threads, 64 outputs => first 64 threads
+                                // each compute 1 output.
+                                for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
+                                    const int j = dim_base + d_in_block;
+                                    const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
+                                    float sum = 0.0f;
+                                    #pragma unroll 1
+                                    for (int d = 0; d < qk_nope; ++d) {
+                                        sum += R_row[d] * s_x[d];
+                                    }
+                                    staging[t * 64 + d_in_block] = bf16(sum);
+                                }
+                                // Sync before reusing s_codes/s_x for the next token.
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            } else {
+                                // Zero out this token's staging slice for this dim_block.
+                                for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
+                                    staging[t * 64 + d_in_block] = bf16(0.0f);
+                                }
+                                // No s_codes/s_x access; no sync needed (all 128
+                                // threads agree on `invalid` since token_index is a
+                                // uniform load).
                             }
-                            staging[entry] = result;
                         }
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
