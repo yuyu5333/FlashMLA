@@ -869,9 +869,15 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     KU_ASSERT(params.h_q % BLOCK_M == 0);
     if constexpr (MODEL_TYPE == ModelType::MODEL1) {
         constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2*HEAD_DIM_ROPE + 8;
-        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
-        if (params.extra_kv != nullptr) {
-            KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
+        // [M3.c.4 Stage-5] When use_packed=true (packed_kcache_ptr non-null),
+        // kv tensor carries packed-FP8 bytes_per_token (e.g. 268 for b=2.5)
+        // and the kernel ignores stride_kv_row in favor of packed_row_bytes.
+        // Native FP8 path (packed_kcache_ptr == nullptr) still enforces 584.
+        if (params.packed_kcache_ptr == nullptr) {
+            KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
+            if (params.extra_kv != nullptr) {
+                KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
+            }
         }
     } else {
         KU_ASSERT(params.extra_kv == nullptr, "V3.2 does not support extra KV cache");
