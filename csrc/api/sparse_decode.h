@@ -407,22 +407,49 @@ sparse_attn_decode_interface(
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     {
-        int bytes_per_token;
+        // [M3.c.4 Stage-5 / B-step1] packed-FP8 path may pass a kv tensor
+        // whose bytes_per_token is the packed row layout (e.g. 268 for
+        // DSv4 b=2.5 wall) instead of the native FP8 layout (584). When
+        // packed_kcache is provided the use_packed=true branch reads the
+        // KV bytes from packed_kcache_ptr and ignores `kv` content, so
+        // the only invariant required here is self-consistency of the kv
+        // tensor's own stride. Accept any bytes_per_token in (0, native].
+        int native_bytes_per_token;
         if (d_qk == 576 && d_v == 512) {
             // V3.2 style
-            bytes_per_token = 512 + 64*2 + (512/128)*4;
+            native_bytes_per_token = 512 + 64*2 + (512/128)*4;
         } else if (d_qk == 512 && d_v == 512) {
             // MODEL1 style
-            bytes_per_token = 448 + 64*2 + (448/64)*1 + 1;
+            native_bytes_per_token = 448 + 64*2 + (448/64)*1 + 1;
         } else {
             TORCH_CHECK(false, "Unsupported head sizes for is_fp8_kvcache == True");
         }
-        KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
-        KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token);
-        TORCH_CHECK(kv.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True for kv cache");
-        if (extra_kv.has_value()) {
-            TORCH_CHECK(extra_kv->stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
+        int bytes_per_token;
+        if (packed_kcache.has_value()) {
+            bytes_per_token = static_cast<int>(kv.size(3));
+            TORCH_CHECK(bytes_per_token > 0 && bytes_per_token <= native_bytes_per_token,
+                "packed-FP8 path: kv bytes_per_token must be in (0, ",
+                native_bytes_per_token, "], got ", bytes_per_token);
+        } else {
+            bytes_per_token = native_bytes_per_token;
         }
+        KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
+        if (extra_kv.has_value()) {
+            // extra_kv (c4/c128 sink) keeps native layout unless packed
+            // path is active. When packed, callers either pass extra_kv
+            // with the same packed bytes_per_token, or omit it; here we
+            // only assert self-consistency.
+            const int extra_bpt = static_cast<int>(extra_kv->size(3));
+            TORCH_CHECK(
+                extra_bpt == bytes_per_token || extra_bpt == native_bytes_per_token,
+                "extra_kv bytes_per_token must equal main kv bytes_per_token (",
+                bytes_per_token, ") or native (", native_bytes_per_token,
+                "); got ", extra_bpt);
+            KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, extra_bpt);
+            TORCH_CHECK(extra_kv->stride(1) == extra_bpt,
+                "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
+        }
+        TORCH_CHECK(kv.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True for kv cache");
     }
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
