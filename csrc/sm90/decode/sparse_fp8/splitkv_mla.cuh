@@ -600,26 +600,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int dim_base = dim_block * 64;
 
                         // ---- Step 1: fill staging with this dim-block (64 dims x 64 tokens) ----
-                        // [DIAG] Direct copy from scale_kcache to staging, bypass bit-unpack + R@x
-                        for (int tok = 0; tok < TOPK_BLOCK_SIZE; ++tok) {
-                            const int token_index = __ldg(indices_base + tok);
-                            if (token_index == -1) {
-                                for (int d = idx_in_warpgroup; d < 64; d += 128) {
-                                    staging[tok * 64 + d] = bf16(0.0f);
-                                }
-                            } else {
-                                const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
-                                const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
-
-                                const float* sk_row = sk_base
-                                    + block_index * page_block_size * qk_nope
-                                    + rel_idx_in_block * qk_nope
-                                    + dim_base;
-
-                                for (int d = idx_in_warpgroup; d < 64; d += 128) {
-                                    staging[tok * 64 + d] = static_cast<bf16>(sk_row[d]);
-                                }
-                            }
+                        // [DIAG-zeros] Write zeros only — bypass scale_kcache entirely
+                        for (int i = idx_in_warpgroup; i < TOPK_BLOCK_SIZE * 64; i += 128) {
+                            staging[i] = bf16(0.0f);
                         }
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
