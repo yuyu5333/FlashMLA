@@ -94,16 +94,17 @@ struct SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutK>> k[NUM_K_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
         array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
+        // [M3.c.4 Stage-2] Packed-FP8 nope staging buffer (one dim-block).
+        // 64 tokens × 64 dims × bf16 = 8KB.
+        // We process 7 dim-blocks (448 / 64 = 7), reusing this staging.
+        // Each block: compute → staging → read to regs → write sK.
+        CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 64];
     } u;
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
-
-    // [M3.c.4 Stage-2] Packed-FP8 nope staging buffer (half block).
-    // Only 32 tokens to keep smem footprint small; we process in two passes.
-    CUTE_ALIGNAS(128) bf16 packed_nope_staging[32 * 512];
 };
 
 template<

@@ -516,17 +516,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 if (use_packed) {
                     // ---- Packed FP8 K-load path (S2-S2 fused dequant) ----
                     //
-                    // Process in two batches of 32 tokens to keep smem
-                    // staging small (32*512 bf16 = 32KB outside union).
-                    //
-                    // Per batch:
-                    //   1. bit-unpack (variable-width via dim_of_bit/bitpos_in_dim)
-                    //   2. affine dequant: x = codes * scale + zero_point
-                    //   3. R @ x rotation (full matrix-vector)
-                    //   4. bf16 -> packed_nope_staging (row-major, 32 tokens)
-                    //   5. copy from staging to GMMA-layout sK
-                    //
-                    // 128 threads collaborate per token; iterate over 32 tokens.
+                    // Process in 7 dim-blocks (448 / 64 = 7).
+                    // Per block (64 dims):
+                    //   1. compute dequant for all 64 tokens → staging (8KB smem in union)
+                    //   2. each thread reads its own token's 64 dims into registers
+                    //   3. named barrier sync (staging no longer needed)
+                    //   4. each thread writes regs to GMMA-layout sK
+                    // This avoids smem overwrite since staging is fully read
+                    // before any sK writes happen.
 
                     const int qk_nope = params.qk_nope_head_dim;
                     const int row_bits = params.row_bits;
@@ -541,7 +538,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int* bpd_base = params.bitpos_in_dim_ptr;
                     const int64_t pk_block_stride = params.packed_kv_block_stride;
 
-                    bf16* staging = plan.packed_nope_staging;
+                    bf16* staging = plan.u.packed_nope_staging;
 
                     // Wait for the nope buffer to be available
                     plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
@@ -554,57 +551,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     __shared__ float s_x[512];
                     __shared__ int s_codes[512];
 
-                    // Initialize staging to 0 (covers invalid tokens)
-                    for (int i = idx_in_warpgroup; i < 32 * qk_nope; i += 128) {
-                        staging[i] = bf16(0.0f);
-                    }
-                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
+                    // ---- First, copy rope half directly (no staging needed) ----
                     CUTE_UNROLL
                     for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
                         int my_token_idx = my_token_idx_base + round*NUM_TOKENS_PER_ROUND;
-                        const int tok_base = round * 32;
-
-                        // ---- Step 1: dequant 32 tokens into staging buffer ----
-                        // [DIAG] Direct copy from scale_kcache to staging, bypass bit-unpack + R@x
-                        for (int tok = 0; tok < 32; ++tok) {
-                            const int abs_tok = tok_base + tok;
-                            const int token_index = __ldg(indices_base + abs_tok);
-                            if (token_index == -1) continue;
-
-                            const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
-                            const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
-
-                            const float* sk_row = sk_base
-                                + block_index * page_block_size * qk_nope
-                                + rel_idx_in_block * qk_nope;
-
-                            for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                                staging[tok * qk_nope + d] = static_cast<bf16>(sk_row[d]);
-                            }
-                        }
-                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                        // ---- Step 2: copy nope from staging to sK (GMMA layout) ----
-                        bf16* sK_nope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*16)*TOPK_BLOCK_SIZE;
-                        bf16* sK_nope_peer_base = get_peer_addr(sK_nope_base);
-
-                        CUTE_UNROLL
-                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
-                            auto copy_bf16x8 = [&](int offset) {
-                                int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
-                                int dim = (lane_idx/8)*16 + dim_idx*64 + offset;
-                                bf16x8 val = *reinterpret_cast<bf16x8*>(&staging[my_token_idx * qk_nope + dim]);
-                                *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&val;
-                                if constexpr (CLUSTER_SIZE == 2) {
-                                    st_async_128b(sK_nope_peer_base + smem_offset, val, peer_bar_k_remote_ready);
-                                }
-                            };
-                            copy_bf16x8(0);
-                            copy_bf16x8(8);
-                        }
-
-                        // ---- Rope half: BF16 direct copy from packed row ----
                         bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
                         bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
 
@@ -640,7 +590,65 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 }
                             }
                         }
+                    }
 
+                    // ---- Now process nope half in 7 dim-blocks ----
+                    // Each thread handles dims (lane_idx/8)*16 .. (lane_idx/8)*16+15
+                    // within each 64-dim block (= 16 dims = 2× bf16x8).
+                    CUTE_UNROLL
+                    for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
+                        const int dim_base = dim_block * 64;
+
+                        // ---- Step 1: fill staging with this dim-block (64 dims x 64 tokens) ----
+                        // [DIAG] Direct copy from scale_kcache to staging, bypass bit-unpack + R@x
+                        for (int tok = 0; tok < TOPK_BLOCK_SIZE; ++tok) {
+                            const int token_index = __ldg(indices_base + tok);
+                            if (token_index == -1) {
+                                for (int d = idx_in_warpgroup; d < 64; d += 128) {
+                                    staging[tok * 64 + d] = bf16(0.0f);
+                                }
+                            } else {
+                                const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
+                                const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
+
+                                const float* sk_row = sk_base
+                                    + block_index * page_block_size * qk_nope
+                                    + rel_idx_in_block * qk_nope
+                                    + dim_base;
+
+                                for (int d = idx_in_warpgroup; d < 64; d += 128) {
+                                    staging[tok * 64 + d] = static_cast<bf16>(sk_row[d]);
+                                }
+                            }
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                        // ---- Step 2 + 3: per round, read staging to regs, write sK ----
+                        CUTE_UNROLL
+                        for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                            int my_token_idx = my_token_idx_base + round*NUM_TOKENS_PER_ROUND;
+                            const int abs_token = idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx;
+                            const int dim_in_block = (lane_idx / 8) * 16;
+
+                            // Read this thread's 16 dims (= 2 x bf16x8) into registers
+                            bf16x8 val_lo = *reinterpret_cast<bf16x8*>(&staging[abs_token * 64 + dim_in_block + 0]);
+                            bf16x8 val_hi = *reinterpret_cast<bf16x8*>(&staging[abs_token * 64 + dim_in_block + 8]);
+
+                            // Write registers to GMMA-layout sK
+                            bf16* sK_nope_base = plan.u.k[buf_idx].data() + abs_token*8 + ((lane_idx/8)*16)*TOPK_BLOCK_SIZE;
+                            bf16* sK_nope_peer_base = get_peer_addr(sK_nope_base);
+
+                            int smem_offset_lo = (dim_base + 0) * TOPK_BLOCK_SIZE;
+                            int smem_offset_hi = (dim_base + 8) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_nope_base + smem_offset_lo) = *(__int128_t*)&val_lo;
+                            *(__int128_t*)(sK_nope_base + smem_offset_hi) = *(__int128_t*)&val_hi;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sK_nope_peer_base + smem_offset_lo, val_lo, peer_bar_k_remote_ready);
+                                st_async_128b(sK_nope_peer_base + smem_offset_hi, val_hi, peer_bar_k_remote_ready);
+                            }
+                        }
+
+                        // All threads done reading staging; safe to refill next dim-block
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                     }
 
