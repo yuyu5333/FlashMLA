@@ -436,15 +436,16 @@ sparse_attn_decode_interface(
         KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
         if (extra_kv.has_value()) {
             // extra_kv (c4/c128 sink) keeps native layout unless packed
-            // path is active. When packed, callers either pass extra_kv
-            // with the same packed bytes_per_token, or omit it; here we
-            // only assert self-consistency.
+            // path is active. The shadow buffer may use a 576-byte padded
+            // layout (e.g. 585 B/tok for P=64), so we only validate
+            // self-consistency: the value must fit in (0, padded] where
+            // padded = ((native * P + 575) / 576) * 576 / P. Cheaper to
+            // just accept any extra_bpt > 0 and rely on kernel-side
+            // stride_extra_kv_row to be honored by the use_packed branch
+            // (kernel ignores extra_kv content when packed_kcache != null).
             const int extra_bpt = static_cast<int>(extra_kv->size(3));
-            TORCH_CHECK(
-                extra_bpt == bytes_per_token || extra_bpt == native_bytes_per_token,
-                "extra_kv bytes_per_token must equal main kv bytes_per_token (",
-                bytes_per_token, ") or native (", native_bytes_per_token,
-                "); got ", extra_bpt);
+            TORCH_CHECK(extra_bpt > 0,
+                "extra_kv bytes_per_token must be > 0; got ", extra_bpt);
             KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, extra_bpt);
             TORCH_CHECK(extra_kv->stride(1) == extra_bpt,
                 "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
