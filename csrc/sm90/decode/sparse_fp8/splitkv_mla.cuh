@@ -595,10 +595,40 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
                         const int dim_base = dim_block * 64;
 
-                        // ---- Step 1: fill staging with this dim-block (64 dims x 64 tokens) ----
-                        // [DIAG-zeros] Write zeros only, bypass scale_kcache entirely
-                        for (int i = idx_in_warpgroup; i < TOPK_BLOCK_SIZE * 64; i += 128) {
-                            staging[i] = bf16(0.0f);
+                        // ---- Step 1: fill staging with bit-unpack + affine dequant ----
+                        // staging[t, d] = code[t, dim_base+d] * scale_kcache[t, dim_base+d] + zero_point[dim_base+d]
+                        // Identity-calib assumption: 1 bit per dim, dim_of_bit[i]=i, bitpos_in_dim[i]=0.
+                        // (R rotation is currently identity; general R support is a follow-up.)
+                        for (int entry = idx_in_warpgroup; entry < TOPK_BLOCK_SIZE * 64; entry += 128) {
+                            const int t = entry / 64;
+                            const int d_in_block = entry % 64;
+                            const int d_global = dim_base + d_in_block;
+
+                            int token_index = __ldg(indices_base + t);
+                            bool out_of_range = false;
+                            if constexpr (MODEL_TYPE == ModelType::MODEL1) {
+                                if (rel_block_idx*TOPK_BLOCK_SIZE + t >= topk_length) {
+                                    out_of_range = true;
+                                }
+                            }
+                            bf16 result;
+                            if (token_index == -1 || out_of_range) {
+                                result = bf16(0.0f);
+                            } else {
+                                const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
+                                const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
+                                const uint8_t* pk_row = pk_base
+                                    + block_index * pk_block_stride
+                                    + rel_idx_in_block * packed_row_bytes;
+                                // 1 bit/dim identity layout: bit d_global lives in byte d_global/8.
+                                uint8_t b = pk_row[d_global >> 3];
+                                int code = (b >> (d_global & 7)) & 1;
+                                // scale_kcache is [num_rows, qk_nope]; row = token_index (= block*page_block_size + rel).
+                                float scale = sk_base[token_index * qk_nope + d_global];
+                                float zp = zp_base[d_global];
+                                result = bf16((float)code * scale + zp);
+                            }
+                            staging[entry] = result;
                         }
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
