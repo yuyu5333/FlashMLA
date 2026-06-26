@@ -832,6 +832,43 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                            (float)staging[t*64 + d+3]);
                                 }
                             }
+                            // [KDUMP7] Non-zero/last 16-dim block checks.
+                            // Compare against writer-side KDUMP7-store-dims:
+                            //   * rotated-domain codes/s_x/sk/zp at dims 16..19 and 432..435
+                            //   * inverse-rotated output staging at dims 16..19 and 432..435
+                            if (batch_idx == sched_meta.begin_req_idx
+                                && block_idx == args.start_block_idx
+                                && buf_idx == 0
+                                && t == 0
+                                && idx_in_warpgroup == 0
+                                && warpgroup_idx == 2
+                                && blockIdx.x == 0
+                                && blockIdx.y == 0
+                                && blockIdx.z == 0
+                                && !IS_EXTRA_BLOCK) {
+                                if (dim_block == 0) {
+                                    printf("[KDUMP7-kernel-dims16] codes[16..19]=%d,%d,%d,%d s_x[16..19]=%f,%f,%f,%f\n",
+                                           s_codes[16], s_codes[17], s_codes[18], s_codes[19],
+                                           s_x[16], s_x[17], s_x[18], s_x[19]);
+                                    printf("[KDUMP7-kernel-dims16] sk[16..19]=%f,%f,%f,%f zp[16..19]=%f,%f,%f,%f\n",
+                                           sk_base[16], sk_base[17], sk_base[18], sk_base[19],
+                                           zp_base[16], zp_base[17], zp_base[18], zp_base[19]);
+                                    printf("[KDUMP7-kernel-dims16] staging[16..19]=%f,%f,%f,%f\n",
+                                           (float)staging[t*64 + 16], (float)staging[t*64 + 17],
+                                           (float)staging[t*64 + 18], (float)staging[t*64 + 19]);
+                                }
+                                if (dim_block == 6) {
+                                    printf("[KDUMP7-kernel-dims432] codes[432..435]=%d,%d,%d,%d s_x[432..435]=%f,%f,%f,%f\n",
+                                           s_codes[432], s_codes[433], s_codes[434], s_codes[435],
+                                           s_x[432], s_x[433], s_x[434], s_x[435]);
+                                    printf("[KDUMP7-kernel-dims432] sk[432..435]=%f,%f,%f,%f zp[432..435]=%f,%f,%f,%f\n",
+                                           sk_base[432], sk_base[433], sk_base[434], sk_base[435],
+                                           zp_base[432], zp_base[433], zp_base[434], zp_base[435]);
+                                    printf("[KDUMP7-kernel-dims432] staging[432..435]=%f,%f,%f,%f\n",
+                                           (float)staging[t*64 + 48], (float)staging[t*64 + 49],
+                                           (float)staging[t*64 + 50], (float)staging[t*64 + 51]);
+                                }
+                            }
                             // Sync before reusing s_codes/s_x for the next token.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                         }
@@ -929,6 +966,32 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 printf("[KDUMP4a-addr] sK_base_off=%lld smem_lo=%d smem_hi=%d dim_base=%d TOPK_BLK=%d\n",
                                        (long long)(sK_nope_base - plan.u.k[buf_idx].data()),
                                        smem_offset_lo, smem_offset_hi, dim_base, (int)TOPK_BLOCK_SIZE);
+                            }
+                            // [KDUMP7] Verify final staging->sK transport for
+                            // the same non-zero/last dim bands that KDUMP7
+                            // prints before the sK write.
+                            if (batch_idx == sched_meta.begin_req_idx
+                                && block_idx == args.start_block_idx
+                                && buf_idx == 0
+                                && round == 0
+                                && abs_token == 0
+                                && warpgroup_idx == 2
+                                && blockIdx.x == 0
+                                && blockIdx.y == 0
+                                && blockIdx.z == 0
+                                && !IS_EXTRA_BLOCK) {
+                                if (dim_block == 0 && dim_in_block == 16) {
+                                    bf16* sK_ptr = sK_nope_base + smem_offset_lo;
+                                    printf("[KDUMP7-sK-dims16] sK[16..19]=%f,%f,%f,%f\n",
+                                           (float)sK_ptr[0], (float)sK_ptr[1],
+                                           (float)sK_ptr[2], (float)sK_ptr[3]);
+                                }
+                                if (dim_block == 6 && dim_in_block == 48) {
+                                    bf16* sK_ptr = sK_nope_base + smem_offset_lo;
+                                    printf("[KDUMP7-sK-dims432] sK[432..435]=%f,%f,%f,%f\n",
+                                           (float)sK_ptr[0], (float)sK_ptr[1],
+                                           (float)sK_ptr[2], (float)sK_ptr[3]);
+                                }
                             }
                             // [KDUMP4b] Coverage sweep: first 16 producer-wg
                             // threads print (idx_in_wg, warp, lane,
