@@ -824,6 +824,99 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 st_async_128b(sK_nope_peer_base + smem_offset_lo, val_lo, peer_bar_k_remote_ready);
                                 st_async_128b(sK_nope_peer_base + smem_offset_hi, val_hi, peer_bar_k_remote_ready);
                             }
+
+                            // [KDUMP4a] Verify staging->sK transport for the
+                            // abs_token=0 / dim_in_block=0 thread, first
+                            // dim_block, first KV buffer of first request.
+                            // Prints (1) staging readback as bf16x8 -> 16
+                            // floats, (2) sK readback at smem_offset_lo /
+                            // smem_offset_hi -> 16 floats, (3) the absolute
+                            // smem offset of sK_nope_base from k[buf_idx]
+                            // base. If staging values diverge from
+                            // KDUMP3.stg[0..7], read-side bug. If sK values
+                            // diverge from staging readback, write-side bug.
+                            if (batch_idx == sched_meta.begin_req_idx
+                                && block_idx == args.start_block_idx
+                                && buf_idx == 0
+                                && dim_block == 0
+                                && round == 0
+                                && abs_token == 0
+                                && dim_in_block == 0
+                                && warpgroup_idx == 2
+                                && blockIdx.x == 0
+                                && blockIdx.y == 0
+                                && blockIdx.z == 0
+                                && !IS_EXTRA_BLOCK) {
+                                bf16* stg_lo_ptr = &staging[abs_token * 64 + dim_in_block + 0];
+                                bf16* stg_hi_ptr = &staging[abs_token * 64 + dim_in_block + 8];
+                                printf("[KDUMP4a-stg-lo] abs_token=%d dim_in_block=%d stg[0..3]=%f %f %f %f\n",
+                                       abs_token, dim_in_block,
+                                       (float)stg_lo_ptr[0], (float)stg_lo_ptr[1],
+                                       (float)stg_lo_ptr[2], (float)stg_lo_ptr[3]);
+                                printf("[KDUMP4a-stg-lo] stg[4..7]=%f %f %f %f\n",
+                                       (float)stg_lo_ptr[4], (float)stg_lo_ptr[5],
+                                       (float)stg_lo_ptr[6], (float)stg_lo_ptr[7]);
+                                printf("[KDUMP4a-stg-hi] stg[8..11]=%f %f %f %f\n",
+                                       (float)stg_hi_ptr[0], (float)stg_hi_ptr[1],
+                                       (float)stg_hi_ptr[2], (float)stg_hi_ptr[3]);
+                                printf("[KDUMP4a-stg-hi] stg[12..15]=%f %f %f %f\n",
+                                       (float)stg_hi_ptr[4], (float)stg_hi_ptr[5],
+                                       (float)stg_hi_ptr[6], (float)stg_hi_ptr[7]);
+                                bf16* val_lo_bf = reinterpret_cast<bf16*>(&val_lo);
+                                bf16* val_hi_bf = reinterpret_cast<bf16*>(&val_hi);
+                                printf("[KDUMP4a-reg-lo] val_lo[0..3]=%f %f %f %f\n",
+                                       (float)val_lo_bf[0], (float)val_lo_bf[1],
+                                       (float)val_lo_bf[2], (float)val_lo_bf[3]);
+                                printf("[KDUMP4a-reg-lo] val_lo[4..7]=%f %f %f %f\n",
+                                       (float)val_lo_bf[4], (float)val_lo_bf[5],
+                                       (float)val_lo_bf[6], (float)val_lo_bf[7]);
+                                printf("[KDUMP4a-reg-hi] val_hi[0..3]=%f %f %f %f\n",
+                                       (float)val_hi_bf[0], (float)val_hi_bf[1],
+                                       (float)val_hi_bf[2], (float)val_hi_bf[3]);
+                                printf("[KDUMP4a-reg-hi] val_hi[4..7]=%f %f %f %f\n",
+                                       (float)val_hi_bf[4], (float)val_hi_bf[5],
+                                       (float)val_hi_bf[6], (float)val_hi_bf[7]);
+                                bf16* sK_lo_ptr = sK_nope_base + smem_offset_lo;
+                                bf16* sK_hi_ptr = sK_nope_base + smem_offset_hi;
+                                printf("[KDUMP4a-sK-lo] sK[lo,0..3]=%f %f %f %f\n",
+                                       (float)sK_lo_ptr[0], (float)sK_lo_ptr[1],
+                                       (float)sK_lo_ptr[2], (float)sK_lo_ptr[3]);
+                                printf("[KDUMP4a-sK-lo] sK[lo,4..7]=%f %f %f %f\n",
+                                       (float)sK_lo_ptr[4], (float)sK_lo_ptr[5],
+                                       (float)sK_lo_ptr[6], (float)sK_lo_ptr[7]);
+                                printf("[KDUMP4a-sK-hi] sK[hi,0..3]=%f %f %f %f\n",
+                                       (float)sK_hi_ptr[0], (float)sK_hi_ptr[1],
+                                       (float)sK_hi_ptr[2], (float)sK_hi_ptr[3]);
+                                printf("[KDUMP4a-sK-hi] sK[hi,4..7]=%f %f %f %f\n",
+                                       (float)sK_hi_ptr[4], (float)sK_hi_ptr[5],
+                                       (float)sK_hi_ptr[6], (float)sK_hi_ptr[7]);
+                                printf("[KDUMP4a-addr] sK_base_off=%lld smem_lo=%d smem_hi=%d dim_base=%d TOPK_BLK=%d\n",
+                                       (long long)(sK_nope_base - plan.u.k[buf_idx].data()),
+                                       smem_offset_lo, smem_offset_hi, dim_base, (int)TOPK_BLOCK_SIZE);
+                            }
+                            // [KDUMP4b] Coverage sweep: first 16 producer-wg
+                            // threads print (idx_in_wg, warp, lane,
+                            // my_token, abs_token, dim_in_block) so we can
+                            // verify the (abs_token, dim_in_block) tiling
+                            // bijectively covers [0..31] x {0,16,32,48} when
+                            // idx_in_cluster=0 (peer cluster handles
+                            // [32..63]).
+                            if (batch_idx == sched_meta.begin_req_idx
+                                && block_idx == args.start_block_idx
+                                && buf_idx == 0
+                                && dim_block == 0
+                                && round == 0
+                                && warpgroup_idx == 2
+                                && idx_in_warpgroup < 16
+                                && blockIdx.x == 0
+                                && blockIdx.y == 0
+                                && blockIdx.z == 0
+                                && !IS_EXTRA_BLOCK) {
+                                printf("[KDUMP4b] idx_in_wg=%d warp=%d lane=%d my_tok=%d abs_tok=%d dim_in_blk=%d idx_in_cluster=%d\n",
+                                       idx_in_warpgroup, warp_idx, lane_idx,
+                                       my_token_idx, abs_token, dim_in_block,
+                                       idx_in_cluster);
+                            }
                         }
 
                         // All threads done reading staging; safe to refill next dim-block
