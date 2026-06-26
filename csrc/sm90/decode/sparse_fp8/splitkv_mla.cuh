@@ -695,6 +695,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             // zeros so sum naturally collapses to 0 (no
                             // separate code path needed -> identical
                             // instruction stream / barrier count).
+                            //
+                            // [KDUMP3 instrumentation] Capture per-thread
+                            // (d_in_block, sum_pre_bf16) into smem so that
+                            // after the producer-sync we can read back
+                            // staging vs the original sum from a single
+                            // thread and detect varargs / printf garbage vs
+                            // real divergent staging writes.
+                            __shared__ float s_sum_dbg[64];
+                            for (int init = idx_in_warpgroup; init < 64; init += 128) {
+                                s_sum_dbg[init] = CUDART_NAN_F;
+                            }
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                             for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
                                 const int j = dim_base + d_in_block;
                                 const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
@@ -704,9 +716,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     sum += R_row[d] * s_x[d];
                                 }
                                 staging[t * 64 + d_in_block] = bf16(sum);
+                                s_sum_dbg[d_in_block] = sum;
                             }
-                            // Sync so the [KDUMP] thread can see all 4 staging
-                            // values written by neighbor threads.
+                            // Sync so the [KDUMP] thread can see all 64
+                            // staging values + s_sum_dbg written by neighbor
+                            // threads.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                             // [KDUMP] Diagnostic: dump first token, first block,
                             // first dim_block, first 4 dims (codes, s_x, staging).
@@ -738,29 +752,49 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                        (long long)pk_block_stride);
                                 // [KDUMP2] Partial sums of R[0,*] * s_x[*] over
                                 // disjoint d ranges so we can localize whether
-                                // R@x diverges in a specific dim band. For a
-                                // Hadamard-256 + identity-192 R, row 0 has
-                                // (1/16) for d<256 and 0 for d>=256, so
-                                // sum_hi should equal 0 and staging[0] should
-                                // equal sum_lo. Mismatch implies R orientation
-                                // or stride bug.
+                                // R@x diverges in a specific dim band. Split
+                                // into small printfs (<=4 %f args each) to
+                                // avoid CUDA device-printf varargs/format
+                                // overrun that produced the bogus 1e+143 values
+                                // in the prior single 41-arg printf.
                                 float sum_lo = 0.0f, sum_hi = 0.0f;
                                 for (int d = 0; d < 256 && d < qk_nope; ++d) sum_lo += R_base[d] * s_x[d];
                                 for (int d = 256; d < qk_nope; ++d) sum_hi += R_base[d] * s_x[d];
-                                printf("[KDUMP2] sum_lo=%f sum_hi=%f sum_total=%f "
-                                       "R[0,d] samples d=0,64,128,255,256,300,447: %f,%f,%f,%f,%f,%f,%f "
-                                       "s_x samples d=0,64,128,255,256,300,447: %f,%f,%f,%f,%f,%f,%f "
-                                       "R[1,0..3]=%f,%f,%f,%f R[2,0..3]=%f,%f,%f,%f R[3,0..3]=%f,%f,%f,%f "
-                                       "staging[4..15]=%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n",
-                                       sum_lo, sum_hi, sum_lo+sum_hi,
-                                       R_base[0], R_base[64], R_base[128], R_base[255], R_base[256], R_base[300], R_base[447],
-                                       s_x[0], s_x[64], s_x[128], s_x[255], s_x[256], s_x[300], s_x[447],
-                                       R_base[1*qk_nope+0], R_base[1*qk_nope+1], R_base[1*qk_nope+2], R_base[1*qk_nope+3],
-                                       R_base[2*qk_nope+0], R_base[2*qk_nope+1], R_base[2*qk_nope+2], R_base[2*qk_nope+3],
-                                       R_base[3*qk_nope+0], R_base[3*qk_nope+1], R_base[3*qk_nope+2], R_base[3*qk_nope+3],
-                                       (float)staging[4], (float)staging[5], (float)staging[6], (float)staging[7],
-                                       (float)staging[8], (float)staging[9], (float)staging[10], (float)staging[11],
-                                       (float)staging[12], (float)staging[13], (float)staging[14], (float)staging[15]);
+                                printf("[KDUMP2a] sum_lo=%f sum_hi=%f total=%f\n",
+                                       sum_lo, sum_hi, sum_lo + sum_hi);
+                                printf("[KDUMP2b] R[0,d] d=0,64,128,255: %f %f %f %f\n",
+                                       R_base[0], R_base[64], R_base[128], R_base[255]);
+                                printf("[KDUMP2c] R[0,d] d=256,300,447: %f %f %f\n",
+                                       R_base[256], R_base[300], R_base[447]);
+                                printf("[KDUMP2d] s_x d=0,64,128,255: %f %f %f %f\n",
+                                       s_x[0], s_x[64], s_x[128], s_x[255]);
+                                printf("[KDUMP2e] s_x d=256,300,447: %f %f %f\n",
+                                       s_x[256], s_x[300], s_x[447]);
+                                printf("[KDUMP2f] R[1,0..3]=%f %f %f %f\n",
+                                       R_base[1*qk_nope+0], R_base[1*qk_nope+1],
+                                       R_base[1*qk_nope+2], R_base[1*qk_nope+3]);
+                                printf("[KDUMP2g] R[2,0..3]=%f %f %f %f\n",
+                                       R_base[2*qk_nope+0], R_base[2*qk_nope+1],
+                                       R_base[2*qk_nope+2], R_base[2*qk_nope+3]);
+                                printf("[KDUMP2h] R[3,0..3]=%f %f %f %f\n",
+                                       R_base[3*qk_nope+0], R_base[3*qk_nope+1],
+                                       R_base[3*qk_nope+2], R_base[3*qk_nope+3]);
+                                // [KDUMP3] Sweep all 64 staging slots vs the
+                                // per-thread captured s_sum_dbg. If any
+                                // s_sum_dbg[d] is NaN, that d_in_block had no
+                                // thread writing -> coverage bug. If staging
+                                // != bf16(s_sum_dbg) modulo bf16 rounding, the
+                                // staging->staging readback path is broken.
+                                for (int d = 0; d < 64; d += 4) {
+                                    printf("[KDUMP3] d=%2d..%2d sum=%f %f %f %f stg=%f %f %f %f\n",
+                                           d, d+3,
+                                           s_sum_dbg[d+0], s_sum_dbg[d+1],
+                                           s_sum_dbg[d+2], s_sum_dbg[d+3],
+                                           (float)staging[t*64 + d+0],
+                                           (float)staging[t*64 + d+1],
+                                           (float)staging[t*64 + d+2],
+                                           (float)staging[t*64 + d+3]);
+                                }
                             }
                             // Sync before reusing s_codes/s_x for the next token.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
