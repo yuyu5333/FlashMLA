@@ -705,6 +705,38 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 }
                                 staging[t * 64 + d_in_block] = bf16(sum);
                             }
+                            // Sync so the [KDUMP] thread can see all 4 staging
+                            // values written by neighbor threads.
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            // [KDUMP] Diagnostic: dump first token, first block,
+                            // first dim_block, first 4 dims (codes, s_x, staging).
+                            // Limited to one producer thread to avoid log spam.
+                            if (batch_idx == sched_meta.begin_req_idx
+                                && block_idx == args.start_block_idx
+                                && buf_idx == 0
+                                && t == 0
+                                && dim_block == 0
+                                && idx_in_warpgroup == 0
+                                && warpgroup_idx == 2
+                                && blockIdx.x == 0
+                                && blockIdx.y == 0
+                                && blockIdx.z == 0
+                                && !IS_EXTRA_BLOCK) {
+                                int tok_idx_dbg = __ldg(indices_base + 0);
+                                printf("[KDUMP] tok_idx=%d qk_nope=%d row_bits=%d packed_row_bytes=%d "
+                                       "codes[0..3]=%d,%d,%d,%d s_x[0..3]=%f,%f,%f,%f "
+                                       "sk[0..3]=%f,%f,%f,%f zp[0..3]=%f,%f,%f,%f "
+                                       "R[0,0..3]=%f,%f,%f,%f staging[0..3]=%f,%f,%f,%f "
+                                       "pk_block_stride=%lld\n",
+                                       tok_idx_dbg, qk_nope, row_bits, packed_row_bytes,
+                                       s_codes[0], s_codes[1], s_codes[2], s_codes[3],
+                                       s_x[0], s_x[1], s_x[2], s_x[3],
+                                       sk_base[0], sk_base[1], sk_base[2], sk_base[3],
+                                       zp_base[0], zp_base[1], zp_base[2], zp_base[3],
+                                       R_base[0], R_base[1], R_base[2], R_base[3],
+                                       (float)staging[0], (float)staging[1], (float)staging[2], (float)staging[3],
+                                       (long long)pk_block_stride);
+                            }
                             // Sync before reusing s_codes/s_x for the next token.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                         }
