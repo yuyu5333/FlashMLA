@@ -588,8 +588,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }
                     }
 
-                    // [M3.c.4 Stage-5 Bug-2 fix] Per-token full unpack + affine
-                    // + R@x dequant.
+                    // [M3.c.4 Stage-5 Bug-3 fix] Per-token full unpack + affine
+                    // + R@x dequant, with **unified barrier sequence** for both
+                    // valid and invalid tokens.
                     //
                     // Calibration convention (build_rotated_kv_calib.py +
                     // rotated_quant_dsv4_kernels.py):
@@ -597,8 +598,21 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     //   load:    nope  = (codes * scale + zero) @ R.t()
                     // With R row-major in memory, the inverse rotation produces
                     //   result[j] = sum_d R[j, d] * x[d]
-                    // where x[d] = codes[d] * scale[d] + zero[d]. This is exactly
-                    // what dense_fp8 fork's flash_fwd_mla_kernel.h does.
+                    // where x[d] = codes[d] * scale[d] + zero[d]. This mirrors
+                    // dense_fp8 fork's flash_fwd_mla_kernel.h prologue + prefetch.
+                    //
+                    // Why unified barriers: the previous revision had the
+                    // invalid path skip all 4 NamedBarriers in the per-token
+                    // loop while the valid path did them. Although `invalid`
+                    // is uniform across the producer warpgroup's 128 threads
+                    // per token, mixing barrier-bearing and barrier-free
+                    // iterations of the SAME loop creates a fragile contract
+                    // with the consumer warpgroups' wait on
+                    // bar_k_local_ready[buf_idx] (arrived after the dim_block
+                    // outer loop). Forcing both branches through the exact
+                    // same 4-barrier sequence makes the producer's smem
+                    // ordering provably consistent with the dense fork's
+                    // gold reference (which has no invalid branching at all).
                     //
                     // s_codes / s_x are token-scoped scratchpads shared by the
                     // 128 producer-WG threads. qk_nope <= 512 (V32: 512, MODEL1:
@@ -615,7 +629,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   bit i lives at byte (i/8), bit (i%8) of a packed row, and
                         //   contributes value (1 << bitpos_in_dim[i]) to dim_of_bit[i].
                         //
-                        // For each token t we:
+                        // For each token t we (always 4 NamedBarriers, both paths):
                         //   (a) s_codes[d] = sum_{i : dim_of_bit[i] == d} bit(i) << bitpos_in_dim[i]
                         //   (b) s_x[d]     = s_codes[d] * scale[d] + zero[d]
                         //   (c) staging[t, d_in_block] = sum_d R[(dim_base+d_in_block), d] * s_x[d]
@@ -629,20 +643,25 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                             const bool invalid = (token_index == -1) || out_of_range;
 
+                            // Compute pk_row pointer up-front (only used when valid).
+                            const uint8_t* pk_row = nullptr;
                             if (!invalid) {
                                 const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
                                 const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
-                                const uint8_t* pk_row = pk_base
+                                pk_row = pk_base
                                     + block_index * pk_block_stride
                                     + rel_idx_in_block * packed_row_bytes;
+                            }
 
-                                // (a-1) init s_codes
-                                for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                                    s_codes[d] = 0;
-                                }
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            // (a-1) init s_codes (always)
+                            for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                s_codes[d] = 0;
+                            }
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
-                                // (a-2) atomicOr each bit slot into its dim
+                            // (a-2) atomicOr each bit slot into its dim (skip for invalid;
+                            // codes remain 0 from init).
+                            if (!invalid) {
                                 for (int bit_idx = idx_in_warpgroup; bit_idx < row_bits; bit_idx += 128) {
                                     const int d = __ldg(dob_base + bit_idx);
                                     const int bpos = __ldg(bpd_base + bit_idx);
@@ -653,39 +672,41 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         atomicOr(&s_codes[d], 1 << bpos);
                                     }
                                 }
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            }
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
-                                // (b) affine dequant: s_x[d] = code * scale[d] + zero[d]
-                                // sk_base / zp_base are per-dim length-qk_nope.
+                            // (b) affine dequant: s_x[d] = codes*scale + zero  for valid
+                            //                     s_x[d] = 0                    for invalid
+                            // sk_base / zp_base are per-dim length-qk_nope.
+                            if (!invalid) {
                                 for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
                                     s_x[d] = (float)s_codes[d] * sk_base[d] + zp_base[d];
                                 }
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                                // (c) R @ s_x for this dim_block's 64 outputs.
-                                // 128 threads, 64 outputs => first 64 threads
-                                // each compute 1 output.
-                                for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
-                                    const int j = dim_base + d_in_block;
-                                    const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
-                                    float sum = 0.0f;
-                                    #pragma unroll 1
-                                    for (int d = 0; d < qk_nope; ++d) {
-                                        sum += R_row[d] * s_x[d];
-                                    }
-                                    staging[t * 64 + d_in_block] = bf16(sum);
-                                }
-                                // Sync before reusing s_codes/s_x for the next token.
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                             } else {
-                                // Zero out this token's staging slice for this dim_block.
-                                for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
-                                    staging[t * 64 + d_in_block] = bf16(0.0f);
+                                for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                    s_x[d] = 0.0f;
                                 }
-                                // No s_codes/s_x access; no sync needed (all 128
-                                // threads agree on `invalid` since token_index is a
-                                // uniform load).
                             }
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                            // (c) R @ s_x for this dim_block's 64 outputs.
+                            // 128 threads, 64 outputs => first 64 threads
+                            // each compute 1 output. For invalid s_x is all
+                            // zeros so sum naturally collapses to 0 (no
+                            // separate code path needed -> identical
+                            // instruction stream / barrier count).
+                            for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
+                                const int j = dim_base + d_in_block;
+                                const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
+                                float sum = 0.0f;
+                                #pragma unroll 1
+                                for (int d = 0; d < qk_nope; ++d) {
+                                    sum += R_row[d] * s_x[d];
+                                }
+                                staging[t * 64 + d_in_block] = bf16(sum);
+                            }
+                            // Sync before reusing s_codes/s_x for the next token.
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                         }
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
