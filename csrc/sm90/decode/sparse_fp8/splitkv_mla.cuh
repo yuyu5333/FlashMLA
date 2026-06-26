@@ -565,6 +565,42 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 + rel_idx_in_block * packed_row_bytes;
                             const bf16* rope_bf16 = reinterpret_cast<const bf16*>(pk_row + nope_bytes);
 
+                            // [KDUMP6-read-rope] Single-thread dump of the
+                            // first rope token's first 8 BF16 values and the
+                            // raw byte offset of pk_row + nope_bytes. Cross-
+                            // check with writer-side KDUMP6-store-rope to
+                            // confirm the rope-half BF16 round-trip is
+                            // byte-identical at slot 0.
+                            if (batch_idx == sched_meta.begin_req_idx
+                                && block_idx == args.start_block_idx
+                                && buf_idx == 0
+                                && round == 0
+                                && idx_in_cluster == 0
+                                && idx_in_warpgroup == 0
+                                && warpgroup_idx == 2
+                                && blockIdx.x == 0
+                                && blockIdx.y == 0
+                                && blockIdx.z == 0
+                                && !IS_EXTRA_BLOCK) {
+                                printf("[KDUMP6-read-rope] tok_idx=%d block_index=%d rel_idx_in_block=%d "
+                                       "packed_row_bytes=%d nope_bytes=%d pk_block_stride=%lld\n",
+                                       token_index, block_index, rel_idx_in_block,
+                                       packed_row_bytes, nope_bytes, (long long)pk_block_stride);
+                                printf("[KDUMP6-read-rope] rope_bf16[0..3]=%f %f %f %f\n",
+                                       (float)rope_bf16[0], (float)rope_bf16[1],
+                                       (float)rope_bf16[2], (float)rope_bf16[3]);
+                                printf("[KDUMP6-read-rope] rope_bf16[4..7]=%f %f %f %f\n",
+                                       (float)rope_bf16[4], (float)rope_bf16[5],
+                                       (float)rope_bf16[6], (float)rope_bf16[7]);
+                                const uint8_t* rb = pk_row + nope_bytes;
+                                printf("[KDUMP6-read-rope] raw_bytes[0..7]=%u %u %u %u %u %u %u %u\n",
+                                       (unsigned)rb[0], (unsigned)rb[1], (unsigned)rb[2], (unsigned)rb[3],
+                                       (unsigned)rb[4], (unsigned)rb[5], (unsigned)rb[6], (unsigned)rb[7]);
+                                printf("[KDUMP6-read-rope] raw_bytes[8..15]=%u %u %u %u %u %u %u %u\n",
+                                       (unsigned)rb[8], (unsigned)rb[9], (unsigned)rb[10], (unsigned)rb[11],
+                                       (unsigned)rb[12], (unsigned)rb[13], (unsigned)rb[14], (unsigned)rb[15]);
+                            }
+
                             CUTE_UNROLL
                             for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
                                 bf16x8 val = *reinterpret_cast<const bf16x8*>(&rope_bf16[(lane_idx/8)*8 + dim_idx*32]);
