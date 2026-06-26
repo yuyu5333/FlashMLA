@@ -736,6 +736,31 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                        R_base[0], R_base[1], R_base[2], R_base[3],
                                        (float)staging[0], (float)staging[1], (float)staging[2], (float)staging[3],
                                        (long long)pk_block_stride);
+                                // [KDUMP2] Partial sums of R[0,*] * s_x[*] over
+                                // disjoint d ranges so we can localize whether
+                                // R@x diverges in a specific dim band. For a
+                                // Hadamard-256 + identity-192 R, row 0 has
+                                // (1/16) for d<256 and 0 for d>=256, so
+                                // sum_hi should equal 0 and staging[0] should
+                                // equal sum_lo. Mismatch implies R orientation
+                                // or stride bug.
+                                float sum_lo = 0.0f, sum_hi = 0.0f;
+                                for (int d = 0; d < 256 && d < qk_nope; ++d) sum_lo += R_base[d] * s_x[d];
+                                for (int d = 256; d < qk_nope; ++d) sum_hi += R_base[d] * s_x[d];
+                                printf("[KDUMP2] sum_lo=%f sum_hi=%f sum_total=%f "
+                                       "R[0,d] samples d=0,64,128,255,256,300,447: %f,%f,%f,%f,%f,%f,%f "
+                                       "s_x samples d=0,64,128,255,256,300,447: %f,%f,%f,%f,%f,%f,%f "
+                                       "R[1,0..3]=%f,%f,%f,%f R[2,0..3]=%f,%f,%f,%f R[3,0..3]=%f,%f,%f,%f "
+                                       "staging[4..15]=%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n",
+                                       sum_lo, sum_hi, sum_lo+sum_hi,
+                                       R_base[0], R_base[64], R_base[128], R_base[255], R_base[256], R_base[300], R_base[447],
+                                       s_x[0], s_x[64], s_x[128], s_x[255], s_x[256], s_x[300], s_x[447],
+                                       R_base[1*qk_nope+0], R_base[1*qk_nope+1], R_base[1*qk_nope+2], R_base[1*qk_nope+3],
+                                       R_base[2*qk_nope+0], R_base[2*qk_nope+1], R_base[2*qk_nope+2], R_base[2*qk_nope+3],
+                                       R_base[3*qk_nope+0], R_base[3*qk_nope+1], R_base[3*qk_nope+2], R_base[3*qk_nope+3],
+                                       (float)staging[4], (float)staging[5], (float)staging[6], (float)staging[7],
+                                       (float)staging[8], (float)staging[9], (float)staging[10], (float)staging[11],
+                                       (float)staging[12], (float)staging[13], (float)staging[14], (float)staging[15]);
                             }
                             // Sync before reusing s_codes/s_x for the next token.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
