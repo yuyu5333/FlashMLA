@@ -307,7 +307,13 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &R_matrix      = std::nullopt,
     const std::optional<at::Tensor> &zero_point    = std::nullopt,
     const std::optional<at::Tensor> &dim_of_bit    = std::nullopt,
-    const std::optional<at::Tensor> &bitpos_in_dim = std::nullopt
+    const std::optional<at::Tensor> &bitpos_in_dim = std::nullopt,
+    // [M3.c.4 Stage-5 Route G step 5] uniform-bit layout switch.
+    // bit_uniform == 0 -> legacy variable-bit layout (default;
+    // backward-compat, byte-identical to pre-step-5). bit_uniform > 0
+    // -> every nope dim uses bit_uniform contiguous bits; per-token
+    // affine (min, range) lives in fp16 header at end of packed row.
+    int64_t bit_uniform                            = 0
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -682,6 +688,23 @@ sparse_attn_decode_interface(
                 static_cast<int64_t>(packed_row_bytes_val);
             params.qk_nope_head_dim = qk_nope_head_dim_val;
             params.row_bits = row_bits_val;
+
+            // [Stage-5 Route G step 5] uniform-bit layout plumbing.
+            // bit_uniform > 0 selects a path-disjoint kernel branch
+            // that reads N-bit uniform codes + per-group fp16 affine
+            // header. bit_uniform == 0 keeps legacy.
+            params.bit_uniform = static_cast<int>(bit_uniform);
+            if (params.bit_uniform > 0) {
+                params.uniform_group_size = 64;
+                TORCH_CHECK(qk_nope_head_dim_val % 64 == 0,
+                    "bit_uniform>0 requires qk_nope_head_dim % 64 == 0, got ",
+                    qk_nope_head_dim_val);
+                params.uniform_num_groups =
+                    qk_nope_head_dim_val / params.uniform_group_size;
+                // 2x fp16 per group: (min, range).
+                params.uniform_header_bytes =
+                    params.uniform_num_groups * 4;
+            }
         }
     }
 

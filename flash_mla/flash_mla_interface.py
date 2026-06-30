@@ -77,6 +77,10 @@ def flash_mla_with_kvcache(
     zero_point: Optional[torch.Tensor] = None,
     dim_of_bit: Optional[torch.Tensor] = None,
     bitpos_in_dim: Optional[torch.Tensor] = None,
+    # [M3.c.4 Stage-5 Route G step 5] uniform-bit layout switch.
+    # 0 -> legacy variable-bit layout (default, byte-identical to
+    # pre-step-5). >0 -> uniform N-bit codes + per-group fp16 affine.
+    bit_uniform: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -172,6 +176,7 @@ def flash_mla_with_kvcache(
             head_dim_v, softmax_scale,
             packed_kcache, scale_kcache, R_matrix, zero_point,
             dim_of_bit, bitpos_in_dim,
+            bit_uniform,
         )
     else:
         # Dense attention

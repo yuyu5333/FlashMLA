@@ -620,6 +620,27 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     __shared__ int s_codes[576];
                     __shared__ float s_x[576];
 
+                    // [Stage-5 Route G step 5] uniform-bit fast path.
+                    //
+                    // Selected when params.bit_uniform > 0. Each nope dim
+                    // uses `bu` contiguous bits, so a single thread can
+                    // locate its own dim's code via byte shift + mask
+                    // (no atomicOr scatter). Per-token affine lives in a
+                    // 28 B (for 7 groups) header right after the code
+                    // bytes and right before the rope BF16 tail:
+                    //     [code_bytes][28 B header][128 B rope]
+                    // header[g] = (fp16 min, fp16 range), 4 B per group.
+                    // s_x[d] = code * (range / ((1<<bu)-1)) + min.
+                    //
+                    // Barrier count per token drops from 4 to 2 (one
+                    // after we fill s_x, one after R@x staging write
+                    // before reusing s_x for the next t).
+                    const int bu = params.bit_uniform;
+                    const int u_groups = params.uniform_num_groups;  // 7 for MODEL1
+                    const int u_hdr_bytes = params.uniform_header_bytes;  // 28
+                    const int u_group_size = params.uniform_group_size;  // 64
+                    const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
+
                     CUTE_UNROLL
                     for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
                         const int dim_base = dim_block * 64;
@@ -653,41 +674,83 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     + rel_idx_in_block * packed_row_bytes;
                             }
 
-                            // (a-1) init s_codes (always)
-                            for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                                s_codes[d] = 0;
-                            }
-                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            if (bu > 0) {
+                                // ---- Uniform-bit fast path (Stage-5 Route G step 5). ----
+                                // Per-token header lives at [pk_row + nope_bytes - u_hdr_bytes].
+                                const uint8_t* hdr_base = invalid
+                                    ? nullptr
+                                    : (pk_row + nope_bytes - u_hdr_bytes);
 
-                            // (a-2) atomicOr each bit slot into its dim (skip for invalid;
-                            // codes remain 0 from init).
-                            if (!invalid) {
-                                for (int bit_idx = idx_in_warpgroup; bit_idx < row_bits; bit_idx += 128) {
-                                    const int d = __ldg(dob_base + bit_idx);
-                                    const int bpos = __ldg(bpd_base + bit_idx);
-                                    const int byte_off = bit_idx >> 3;
-                                    const int bit_off = bit_idx & 7;
-                                    const int bit_v = (pk_row[byte_off] >> bit_off) & 1;
-                                    if (bit_v) {
-                                        atomicOr(&s_codes[d], 1 << bpos);
+                                // Fill s_x directly (no atomicOr; no global scale/zp loads).
+                                // For invalid tokens: s_x[d] = 0 -> R@x naturally yields 0.
+                                if (!invalid) {
+                                    for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                        const int bit_off_global = d * bu;
+                                        const int byte_off = bit_off_global >> 3;
+                                        const int shift = bit_off_global & 7;
+                                        // Load up to 4 contiguous bytes covering up to 32 bits.
+                                        // bu in {2,3,4} -> spans <= 2 bytes; safe to read 2.
+                                        uint32_t word = (uint32_t)pk_row[byte_off];
+                                        word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
+                                        // bu can be 5..8 for future; read 1 more byte for safety.
+                                        if (bu > 8) {
+                                            word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
+                                        }
+                                        const uint32_t mask = (1u << bu) - 1u;
+                                        const int code = (int)((word >> shift) & mask);
+                                        // Group affine from header (4 B per group: fp16 min + fp16 range).
+                                        const int g = d / u_group_size;
+                                        const __half* hdr_h =
+                                            reinterpret_cast<const __half*>(hdr_base + g * 4);
+                                        const float fmin   = __half2float(hdr_h[0]);
+                                        const float frange = __half2float(hdr_h[1]);
+                                        const float fstep  = frange * (1.0f / u_step_denom);
+                                        s_x[d] = (float)code * fstep + fmin;
+                                    }
+                                } else {
+                                    for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                        s_x[d] = 0.0f;
                                     }
                                 }
-                            }
-                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                            // (b) affine dequant: s_x[d] = codes*scale + zero  for valid
-                            //                     s_x[d] = 0                    for invalid
-                            // sk_base / zp_base are per-dim length-qk_nope.
-                            if (!invalid) {
-                                for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                                    s_x[d] = (float)s_codes[d] * sk_base[d] + zp_base[d];
-                                }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                             } else {
+                                // ---- Legacy variable-bit path (path-disjoint). ----
+                                // (a-1) init s_codes (always)
                                 for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
-                                    s_x[d] = 0.0f;
+                                    s_codes[d] = 0;
                                 }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                // (a-2) atomicOr each bit slot into its dim (skip for invalid;
+                                // codes remain 0 from init).
+                                if (!invalid) {
+                                    for (int bit_idx = idx_in_warpgroup; bit_idx < row_bits; bit_idx += 128) {
+                                        const int d = __ldg(dob_base + bit_idx);
+                                        const int bpos = __ldg(bpd_base + bit_idx);
+                                        const int byte_off = bit_idx >> 3;
+                                        const int bit_off = bit_idx & 7;
+                                        const int bit_v = (pk_row[byte_off] >> bit_off) & 1;
+                                        if (bit_v) {
+                                            atomicOr(&s_codes[d], 1 << bpos);
+                                        }
+                                    }
+                                }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                // (b) affine dequant: s_x[d] = codes*scale + zero  for valid
+                                //                     s_x[d] = 0                    for invalid
+                                // sk_base / zp_base are per-dim length-qk_nope.
+                                if (!invalid) {
+                                    for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                        s_x[d] = (float)s_codes[d] * sk_base[d] + zp_base[d];
+                                    }
+                                } else {
+                                    for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
+                                        s_x[d] = 0.0f;
+                                    }
+                                }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                             }
-                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                             // (c) R @ s_x for this dim_block's 64 outputs.
                             // 128 threads, 64 outputs => first 64 threads

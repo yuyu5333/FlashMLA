@@ -141,6 +141,26 @@ struct SparseAttnDecodeParams {
     int                 packed_row_bytes      = 0;
     int                 qk_nope_head_dim      = 0;
     int                 row_bits              = 0;
+
+    // ------------------------------------------------------------------
+    // [M3.c.4 Stage-5 Route G step 5] uniform-bit layout switch.
+    //
+    // When bit_uniform == 0 (default), the kernel reads the variable-bit
+    // layout described above (dim_of_bit/bitpos_in_dim + global scale/zp
+    // arrays). When bit_uniform > 0 (e.g. 3 or 4), every nope dim uses
+    // bit_uniform contiguous bits; per-token affine (min, range) is
+    // stored as fp16 pairs in a header at the end of the packed row,
+    // sized uniform_header_bytes = uniform_num_groups * 4. This lets the
+    // kernel inner-loop avoid atomicOr scatter (each thread reads its
+    // own dim's N-bit code via byte shift + mask) and avoid the global
+    // scale/zp loads (per-group affine fits in 28 B for groups=7).
+    //
+    // bit_uniform == 0 -> legacy path (byte-identical to pre-step-5).
+    // ------------------------------------------------------------------
+    int                 bit_uniform           = 0;
+    int                 uniform_header_bytes  = 0;
+    int                 uniform_group_size    = 64;
+    int                 uniform_num_groups    = 0;
 };
 
 struct CombineParams {
