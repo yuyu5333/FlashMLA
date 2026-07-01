@@ -776,30 +776,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             //   16B 对齐；R_row 是 fp32 global，j*qk_nope*4B
                             //   起点也 16B 对齐（qk_nope 是 8 的倍数）。
                             {
+                                // [Stage-5 Route G step6.2 DIAGNOSTIC]
+                                //   临时 skip R@x FMA，只写 0 到 staging，用于
+                                //   隔离 R@x FMA 占 producer 时间的比例。
+                                //   - 若 tps 大涨（>2×）→ R@x 是主瓶颈 → 值得 wgmma
+                                //   - 若 tps 变化不大 → 瓶颈在 unpack/affine/
+                                //     barrier/staging→sK，需换方向
+                                //   保留 unpack+affine（s_x fill）+ barrier 序列 +
+                                //   staging write + staging→sK flush，只把 FMA
+                                //   loop 换成 0。
                                 const int lane = idx_in_warpgroup;
-                                const int pair_id = lane >> 1;          // 0..63
-                                const int half = lane & 1;              // 0 or 1
-                                const int j = dim_base + pair_id;
-                                const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
-                                const int qk_half = qk_nope >> 1;       // 224
-                                const int d_start = half * qk_half;
-                                float sum = 0.0f;
-                                #pragma unroll 1
-                                for (int d = 0; d < qk_half; d += 4) {
-                                    const int gd = d_start + d;
-                                    const float4 r4 = *reinterpret_cast<const float4*>(R_row + gd);
-                                    const float4 x4 = *reinterpret_cast<const float4*>(&s_x[gd]);
-                                    sum += r4.x * x4.x;
-                                    sum += r4.y * x4.y;
-                                    sum += r4.z * x4.z;
-                                    sum += r4.w * x4.w;
-                                }
-                                // Merge lane pair (l, l^1) within warp.
-                                sum += __shfl_xor_sync(0xffffffff, sum, 1);
-                                // Only even lane writes staging (both lanes hold
-                                // the same reduced sum after shfl_xor).
+                                const int pair_id = lane >> 1;
+                                const int half = lane & 1;
                                 if (half == 0) {
-                                    staging[t * 64 + pair_id] = bf16(sum);
+                                    staging[t * 64 + pair_id] = bf16(0.0f);
                                 }
                             }
                             // Sync before reusing s_codes/s_x for the next token.
