@@ -619,17 +619,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // 448); we size to 576 to stay above HEAD_DIM_K.
                     __shared__ int s_codes[576];
                     __shared__ float s_x[576];
-                    // [Stage-5 Route G step6.3] Per-token header cache.
-                    //   header = 7 groups × (fp16 min + fp16 range) = 28 B.
-                    //   Previously: every one of 128 threads issued its own
-                    //   uncoalesced 4-byte header LDG per dim (up to qk_nope/128
-                    //   ≈ 4 dims per thread → up to 4 × 2 half-loads global).
-                    //   Now: 128 threads cooperatively load the 7 float2 groups
-                    //   into smem once per token (one coalesced LDG per group),
-                    //   then per-dim unpack reads smem (LDS ≫ LDG). Also
-                    //   pre-multiplies range × (1/u_step_denom) so the inner
-                    //   loop does 1 FMA instead of mul+FMA.
-                    __shared__ float2 s_hdr[16];  // step,min per group; hold up to 16 groups
+                    // [Stage-5 Route G step6.4] revert step6.3 header smem cache:
+                    // the extra NamedBarrier::sync(128,...) needed to publish
+                    // s_hdr across the 128 producer threads costs ~100 cyc/token
+                    // but empirically dropped 32-req steady-state gen tps from
+                    // 12.19 -> 6.76 (measured on fp8-dsv4 canary 09:05:35 UTC).
+                    // Producer WG has only 128 threads and is Q/K-bound, not
+                    // header-LDG bound, so per-thread ldg header (already
+                    // L2-hot after step6.1 warm-up) is cheaper than a
+                    // whole-warp synchronization. Route to reclaim tps.
 
                     // [Stage-5 Route G step 5] uniform-bit fast path.
                     //
@@ -686,34 +684,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
 
                             if (bu > 0) {
-                                // ---- Uniform-bit fast path (Stage-5 Route G step6.3). ----
-                                //
-                                // Optimization vs step6.1: replace up to 4
-                                // per-thread uncoalesced __half2float LDGs
-                                // (each dim reloads its group's 2 fp16 header
-                                // entries from global) with a cooperative
-                                // warp-0 header prefetch into __shared__ s_hdr
-                                // holding pre-computed (fstep, fmin) per group.
-                                // Inner loop then does 1 FMA + 1 LDS per dim.
-                                //
-                                // Adds 1 NamedBarrier per token (2 -> 3) to
-                                // publish s_hdr across warps; this is a net
-                                // win because global LDG latency (128 threads
-                                // × ~4 header LDG × ~400 cyc) >> barrier cost
-                                // (~100 cyc).
-                                if (!invalid) {
-                                    if (idx_in_warpgroup < u_groups) {
-                                        const uint8_t* hdr_base = pk_row + nope_bytes - u_hdr_bytes;
-                                        const __half* hdr_h =
-                                            reinterpret_cast<const __half*>(hdr_base + idx_in_warpgroup * 4);
-                                        const float fmin   = __half2float(hdr_h[0]);
-                                        const float frange = __half2float(hdr_h[1]);
-                                        const float fstep  = frange * (1.0f / u_step_denom);
-                                        s_hdr[idx_in_warpgroup] = make_float2(fstep, fmin);
-                                    }
-                                }
-                                // Publish s_hdr across the 128 producer-WG threads.
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                                // ---- Uniform-bit fast path (Stage-5 Route G step6.4). ----
+                                // Same as step6.1: per-thread ldg header (L2-hot
+                                // after 7-group warm-up on the first few tokens)
+                                // + 1 FMA per dim. No smem cache (step6.3 attempt
+                                // regressed 12.19 -> 6.76 tps due to the extra
+                                // NamedBarrier::sync(128,...) needed to publish
+                                // s_hdr across the 128 producer-WG threads).
+                                const uint8_t* hdr_base = invalid
+                                    ? nullptr
+                                    : (pk_row + nope_bytes - u_hdr_bytes);
 
                                 if (!invalid) {
                                     for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
@@ -728,8 +708,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         const uint32_t mask = (1u << bu) - 1u;
                                         const int code = (int)((word >> shift) & mask);
                                         const int g = d / u_group_size;
-                                        const float2 hg = s_hdr[g];  // (fstep, fmin)
-                                        s_x[d] = fmaf((float)code, hg.x, hg.y);
+                                        const __half* hdr_h =
+                                            reinterpret_cast<const __half*>(hdr_base + g * 4);
+                                        const float fmin   = __half2float(hdr_h[0]);
+                                        const float frange = __half2float(hdr_h[1]);
+                                        const float fstep  = frange * (1.0f / u_step_denom);
+                                        s_x[d] = fmaf((float)code, fstep, fmin);
                                     }
                                 } else {
                                     for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
