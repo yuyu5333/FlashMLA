@@ -619,6 +619,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // 448); we size to 576 to stay above HEAD_DIM_K.
                     __shared__ int s_codes[576];
                     __shared__ float s_x[576];
+                    // [Stage-5 Route G step6.3] Per-token header cache.
+                    //   header = 7 groups × (fp16 min + fp16 range) = 28 B.
+                    //   Previously: every one of 128 threads issued its own
+                    //   uncoalesced 4-byte header LDG per dim (up to qk_nope/128
+                    //   ≈ 4 dims per thread → up to 4 × 2 half-loads global).
+                    //   Now: 128 threads cooperatively load the 7 float2 groups
+                    //   into smem once per token (one coalesced LDG per group),
+                    //   then per-dim unpack reads smem (LDS ≫ LDG). Also
+                    //   pre-multiplies range × (1/u_step_denom) so the inner
+                    //   loop does 1 FMA instead of mul+FMA.
+                    __shared__ float2 s_hdr[16];  // step,min per group; hold up to 16 groups
 
                     // [Stage-5 Route G step 5] uniform-bit fast path.
                     //
@@ -675,37 +686,50 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
 
                             if (bu > 0) {
-                                // ---- Uniform-bit fast path (Stage-5 Route G step 5). ----
-                                // Per-token header lives at [pk_row + nope_bytes - u_hdr_bytes].
-                                const uint8_t* hdr_base = invalid
-                                    ? nullptr
-                                    : (pk_row + nope_bytes - u_hdr_bytes);
+                                // ---- Uniform-bit fast path (Stage-5 Route G step6.3). ----
+                                //
+                                // Optimization vs step6.1: replace up to 4
+                                // per-thread uncoalesced __half2float LDGs
+                                // (each dim reloads its group's 2 fp16 header
+                                // entries from global) with a cooperative
+                                // warp-0 header prefetch into __shared__ s_hdr
+                                // holding pre-computed (fstep, fmin) per group.
+                                // Inner loop then does 1 FMA + 1 LDS per dim.
+                                //
+                                // Adds 1 NamedBarrier per token (2 -> 3) to
+                                // publish s_hdr across warps; this is a net
+                                // win because global LDG latency (128 threads
+                                // × ~4 header LDG × ~400 cyc) >> barrier cost
+                                // (~100 cyc).
+                                if (!invalid) {
+                                    if (idx_in_warpgroup < u_groups) {
+                                        const uint8_t* hdr_base = pk_row + nope_bytes - u_hdr_bytes;
+                                        const __half* hdr_h =
+                                            reinterpret_cast<const __half*>(hdr_base + idx_in_warpgroup * 4);
+                                        const float fmin   = __half2float(hdr_h[0]);
+                                        const float frange = __half2float(hdr_h[1]);
+                                        const float fstep  = frange * (1.0f / u_step_denom);
+                                        s_hdr[idx_in_warpgroup] = make_float2(fstep, fmin);
+                                    }
+                                }
+                                // Publish s_hdr across the 128 producer-WG threads.
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
-                                // Fill s_x directly (no atomicOr; no global scale/zp loads).
-                                // For invalid tokens: s_x[d] = 0 -> R@x naturally yields 0.
                                 if (!invalid) {
                                     for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
                                         const int bit_off_global = d * bu;
                                         const int byte_off = bit_off_global >> 3;
                                         const int shift = bit_off_global & 7;
-                                        // Load up to 4 contiguous bytes covering up to 32 bits.
-                                        // bu in {2,3,4} -> spans <= 2 bytes; safe to read 2.
                                         uint32_t word = (uint32_t)pk_row[byte_off];
                                         word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
-                                        // bu can be 5..8 for future; read 1 more byte for safety.
                                         if (bu > 8) {
                                             word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                         }
                                         const uint32_t mask = (1u << bu) - 1u;
                                         const int code = (int)((word >> shift) & mask);
-                                        // Group affine from header (4 B per group: fp16 min + fp16 range).
                                         const int g = d / u_group_size;
-                                        const __half* hdr_h =
-                                            reinterpret_cast<const __half*>(hdr_base + g * 4);
-                                        const float fmin   = __half2float(hdr_h[0]);
-                                        const float frange = __half2float(hdr_h[1]);
-                                        const float fstep  = frange * (1.0f / u_step_denom);
-                                        s_x[d] = (float)code * fstep + fmin;
+                                        const float2 hg = s_hdr[g];  // (fstep, fmin)
+                                        s_x[d] = fmaf((float)code, hg.x, hg.y);
                                     }
                                 } else {
                                     for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
@@ -769,27 +793,29 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             //     综合 ~4× 加速 R@x 阶段。
                             //   - 对 s_x 语义无假设：invalid token s_x 全 0 时
                             //     sum 天然为 0，barrier 序列与 legacy 完全一致。
-                            //
-                            //   数值约束：
-                            //   qk_nope % 8 == 0（MODEL1: 448, V32: 512）✓
-                            //   s_x 是 __shared__ float [576]，静态 SMEM 默认
-                            //   16B 对齐；R_row 是 fp32 global，j*qk_nope*4B
-                            //   起点也 16B 对齐（qk_nope 是 8 的倍数）。
                             {
-                                // [Stage-5 Route G step6.2 DIAGNOSTIC]
-                                //   临时 skip R@x FMA，只写 0 到 staging，用于
-                                //   隔离 R@x FMA 占 producer 时间的比例。
-                                //   - 若 tps 大涨（>2×）→ R@x 是主瓶颈 → 值得 wgmma
-                                //   - 若 tps 变化不大 → 瓶颈在 unpack/affine/
-                                //     barrier/staging→sK，需换方向
-                                //   保留 unpack+affine（s_x fill）+ barrier 序列 +
-                                //   staging write + staging→sK flush，只把 FMA
-                                //   loop 换成 0。
                                 const int lane = idx_in_warpgroup;
-                                const int pair_id = lane >> 1;
-                                const int half = lane & 1;
+                                const int pair_id = lane >> 1;          // 0..63
+                                const int half = lane & 1;              // 0 or 1
+                                const int j = dim_base + pair_id;
+                                const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
+                                const int qk_half = qk_nope >> 1;       // 224
+                                const int d_start = half * qk_half;
+                                float sum = 0.0f;
+                                #pragma unroll 1
+                                for (int d = 0; d < qk_half; d += 4) {
+                                    const int gd = d_start + d;
+                                    const float4 r4 = *reinterpret_cast<const float4*>(R_row + gd);
+                                    const float4 x4 = *reinterpret_cast<const float4*>(&s_x[gd]);
+                                    sum += r4.x * x4.x;
+                                    sum += r4.y * x4.y;
+                                    sum += r4.z * x4.z;
+                                    sum += r4.w * x4.w;
+                                }
+                                // Merge lane pair (l, l^1) within warp.
+                                sum += __shfl_xor_sync(0xffffffff, sum, 1);
                                 if (half == 0) {
-                                    staging[t * 64 + pair_id] = bf16(0.0f);
+                                    staging[t * 64 + pair_id] = bf16(sum);
                                 }
                             }
                             // Sync before reusing s_codes/s_x for the next token.
