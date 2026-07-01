@@ -753,20 +753,54 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
 
                             // (c) R @ s_x for this dim_block's 64 outputs.
-                            // 128 threads, 64 outputs => first 64 threads
-                            // each compute 1 output. For invalid s_x is all
-                            // zeros so sum naturally collapses to 0 (no
-                            // separate code path needed -> identical
-                            // instruction stream / barrier count).
-                            for (int d_in_block = idx_in_warpgroup; d_in_block < 64; d_in_block += 128) {
-                                const int j = dim_base + d_in_block;
+                            // [Stage-5 Route G step6.1] 双 lane 协作 + float4 向量化.
+                            //   - 128 lanes 全部激活: pair (l, l^1) 同 warp，
+                            //     每 pair 计算 1 个 output j = l/2 (lane 0/1
+                            //     -> j=0, lane 2/3 -> j=1, ..., lane 62/63 -> j=31;
+                            //     lane 64/65 -> j=32, ..., lane 126/127 -> j=63)。
+                            //   - 每 lane 累加 half dims (224)，从 half-offset
+                            //     开始，用 float4 一次 load 4 个 (R, s_x) 做 4× FMA。
+                            //   - qk_nope=448 -> 224/4 = 56 iter/lane。
+                            //   - 用 __shfl_xor_sync(mask, sum, 1) 在 pair 内合并。
+                            //   - 相比旧 kernel (64 lane 各 448 标量 MADD)：
+                            //     lane 利用率 64->128 (×2)，
+                            //     每 lane MADD 数 448->56*4=224 (× 0.5 计算量)，
+                            //     LDG/LDS 从 float 变 float4 (×4 带宽利用)。
+                            //     综合 ~4× 加速 R@x 阶段。
+                            //   - 对 s_x 语义无假设：invalid token s_x 全 0 时
+                            //     sum 天然为 0，barrier 序列与 legacy 完全一致。
+                            //
+                            //   数值约束：
+                            //   qk_nope % 8 == 0（MODEL1: 448, V32: 512）✓
+                            //   s_x 是 __shared__ float [576]，静态 SMEM 默认
+                            //   16B 对齐；R_row 是 fp32 global，j*qk_nope*4B
+                            //   起点也 16B 对齐（qk_nope 是 8 的倍数）。
+                            {
+                                const int lane = idx_in_warpgroup;
+                                const int pair_id = lane >> 1;          // 0..63
+                                const int half = lane & 1;              // 0 or 1
+                                const int j = dim_base + pair_id;
                                 const float* R_row = R_base + (int64_t)j * (int64_t)qk_nope;
+                                const int qk_half = qk_nope >> 1;       // 224
+                                const int d_start = half * qk_half;
                                 float sum = 0.0f;
                                 #pragma unroll 1
-                                for (int d = 0; d < qk_nope; ++d) {
-                                    sum += R_row[d] * s_x[d];
+                                for (int d = 0; d < qk_half; d += 4) {
+                                    const int gd = d_start + d;
+                                    const float4 r4 = *reinterpret_cast<const float4*>(R_row + gd);
+                                    const float4 x4 = *reinterpret_cast<const float4*>(&s_x[gd]);
+                                    sum += r4.x * x4.x;
+                                    sum += r4.y * x4.y;
+                                    sum += r4.z * x4.z;
+                                    sum += r4.w * x4.w;
                                 }
-                                staging[t * 64 + d_in_block] = bf16(sum);
+                                // Merge lane pair (l, l^1) within warp.
+                                sum += __shfl_xor_sync(0xffffffff, sum, 1);
+                                // Only even lane writes staging (both lanes hold
+                                // the same reduced sum after shfl_xor).
+                                if (half == 0) {
+                                    staging[t * 64 + pair_id] = bf16(sum);
+                                }
                             }
                             // Sync before reusing s_codes/s_x for the next token.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
