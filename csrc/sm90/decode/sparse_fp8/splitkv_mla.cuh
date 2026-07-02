@@ -245,17 +245,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
                 scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
 
-                // Store S into shared, inform warpgroup 1
-                save_rPb_to_sP(rS, sS, idx_in_warpgroup);
-                fence_view_async_shared();
-
-                // Issue O += S @ V
+                // Issue O += S @ V early so wgmma can run async while STSM writes sS for WG1
                 gemm<false, -1>(
                     tiled_mma_PV,
                     rS,
                     thr_mma_PV.partition_fragment_B(sV),
                     rO
                 );
+
+                // Store S into shared, inform warpgroup 1 (overlaps with PV wgmma)
+                save_rPb_to_sP(rS, sS, idx_in_warpgroup);
+                fence_view_async_shared();
 
                 NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
 
