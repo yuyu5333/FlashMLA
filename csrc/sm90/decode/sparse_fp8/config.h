@@ -109,11 +109,10 @@ struct SharedMemoryPlan {
     //   - legacy variable-bit path (bu == 0): staging holds scalar R@X output
     //     that is then copied to GMMA-layout sK.
     //   - wgmma uniform-bit path (bu > 0, MODEL1, Route G step 4+5): during
-    //     the wgmma issue phase, this buffer aliases the "sX K-tile" A operand
-    //     (128 producer threads fill 64x64 bf16 K-major). After the last
-    //     wgmma retires, the same 8KB is overwritten with the bf16(rC)
-    //     output (per-thread fragment scatter) so the existing staging->sK
-    //     copy path stays byte-identical between the two variants.
+    //     the wgmma issue phase, this buffer aliases sX_tile[0] (primary sX
+    //     A operand). After the last wgmma retires, the same 8KB is
+    //     overwritten with the bf16(rC) output (per-thread fragment scatter)
+    //     so the existing staging->sK copy path stays byte-identical.
     CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 64];
 
     // [M3.c.4 Stage-5 Route G step 4+5] wgmma R matrix K-tile in smem.
@@ -122,14 +121,24 @@ struct SharedMemoryPlan {
     //   Loaded from R_base per (dim_block, K-tile). Consumed by wgmma as B
     //   in MMA_64x64x16_F32BF16BF16_SS<K, K>.
     //
-    // [Route G step 7 double-buffer] Sized as [2] to enable wgmma <-> fill
-    //   overlap across the kt loop. Iteration kt writes into packed_r_tile[
-    //   kt & 1] while wgmma_(kt-1) still reads packed_r_tile[(kt-1) & 1].
-    //   Net +8 KB (16 KB total). sX_tile remains single-buffer (aliases
-    //   packed_nope_staging, dual-use with rC scatter), so the pipeline
-    //   depth is 1: kt+1 fill sX only runs after warpgroup_wait<0> retires
-    //   the previous wgmma.
-    CUTE_ALIGNAS(128) array_aligned<bf16, cosize_v<SmemLayoutKTile>> packed_r_tile[2];
+    // [Route G step 8 revert to single-buffer] step 7 sR double-buffer was
+    //   null-effect (+0.3% tps): sR fill is pure __ldg fp32 already covered
+    //   by wgmma shadow. Reverting to single-buffer frees 8 KB smem for the
+    //   real bottleneck: sX fill (byte deref + header lookup + fmaf) which
+    //   must be double-buffered to hide behind wgmma.
+    CUTE_ALIGNAS(128) array_aligned<bf16, cosize_v<SmemLayoutKTile>> packed_r_tile;
+
+    // [Route G step 8 sX double-buffer] Alternate sX K-tile.
+    //   packed_nope_staging holds sX_tile[0] (also dual-used for rC scatter
+    //   / staging->sK copy). This buffer holds sX_tile[1] used ONLY during
+    //   the wgmma issue phase (no rC scatter alias here). Kt-loop pattern:
+    //     iter kt writes into sX_slot[(kt+1) & 1] while wgmma_(kt) still
+    //     reads sX_slot[kt & 1]. Barrier count drops from 1 barrier/kt
+    //     (step7) to 1 barrier per (kt+1) *after* the wgmma retires only
+    //     to make the freshly-filled sX visible; the wgmma of kt no longer
+    //     stalls the fill of kt+1. Net smem: -8 KB (sR single) + 8 KB
+    //     (sX_alt) = 0 KB (stays under 228 KB SM90 limit).
+    CUTE_ALIGNAS(128) bf16 packed_x_alt_tile[64 * 64];
 };
 
 template<

@@ -627,25 +627,31 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
-                        // sX_tile aliases the 8KB packed_nope_staging.
-                        Tensor sX_tile = make_tensor(
+                        // [Route G step 8 sX double-buffer]
+                        //   sX_slot[0] aliases packed_nope_staging (also
+                        //     dual-used later for rC scatter and staging->sK).
+                        //   sX_slot[1] lives in packed_x_alt_tile (wgmma-only,
+                        //     never scattered). 8+8=16 KB total for sX (net 0
+                        //     vs step7 since sR reverts to single-buffer).
+                        Tensor sX_slot_0 = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
                             SmemLayoutKTile{}
                         );
-                        // [Route G step 7 double-buffer] sR is now [2].
-                        // Iter kt consumes sR[kt&1] while iter kt+1 prefetch
-                        // fills sR[(kt+1)&1] in parallel with the wgmma.
-                        Tensor sR_tile_0 = make_tensor(
-                            make_smem_ptr(plan.packed_r_tile[0].data()),
+                        Tensor sX_slot_1 = make_tensor(
+                            make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_x_alt_tile)),
                             SmemLayoutKTile{}
                         );
-                        Tensor sR_tile_1 = make_tensor(
-                            make_smem_ptr(plan.packed_r_tile[1].data()),
+                        // sR reverts to single-buffer (step7 sR double-buffer
+                        // was null-effect: sR fill is __ldg fp32, already in
+                        // wgmma shadow. Real bottleneck is sX fill, now
+                        // double-buffered above).
+                        Tensor sR_tile = make_tensor(
+                            make_smem_ptr(plan.packed_r_tile.data()),
                             SmemLayoutKTile{}
                         );
                         // Plain [64 tokens, 64 dim_out] view over the same 8KB
-                        // used to scatter bf16(rC) and to source 128-bit copies
-                        // to sK (byte-identical to the legacy staging path).
+                        // as sX_slot_0 (packed_nope_staging), used to scatter
+                        // bf16(rC) and to source 128-bit copies to sK.
                         Tensor sStaging = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
                             Layout<Shape<Int<64>, Int<64>>, Stride<Int<64>, _1>>{}
@@ -657,10 +663,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int k_tiles = qk_nope / 64;  // 7 for MODEL1
 
                         // Helper lambdas: fill sX/sR from global for a given k_base.
-                        // Both are pure per-thread writes into disjoint smem regions;
-                        // caller is responsible for fence + NamedBarrier before the
-                        // consumer (wgmma) reads them.
-                        auto fill_sX_tile = [&](int k_base) {
+                        // fill_sX_tile takes a sX destination tensor so it can
+                        // target either slot; fill_sR_tile targets the single
+                        // sR_tile.
+                        auto fill_sX_tile = [&](auto &sX_dst, int k_base) {
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int lin = e * 128 + idx_in_warpgroup;
@@ -705,11 +711,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     const float fstep = frange * (1.0f / u_step_denom);
                                     x_val = fmaf((float)code, fstep, fmin);
                                 }
-                                sX_tile(t, d) = bf16(x_val);
+                                sX_dst(t, d) = bf16(x_val);
                             }
                         };
 
-                        auto fill_sR_tile = [&](auto &sR_dst, int dim_base, int k_base) {
+                        auto fill_sR_tile = [&](int dim_base, int k_base) {
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int lin = e * 128 + idx_in_warpgroup;
@@ -720,7 +726,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const float r_val = __ldg(
                                     R_base + (int64_t)j_global * (int64_t)qk_nope + (int64_t)d_global
                                 );
-                                sR_dst(j, d) = bf16(r_val);
+                                sR_tile(j, d) = bf16(r_val);
                             }
                         };
 
@@ -733,9 +739,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             );
                             clear(rC);
 
-                            // ---- Prologue: fill sX(kt=0) + sR[0](kt=0) ----
-                            fill_sX_tile(0);
-                            fill_sR_tile(sR_tile_0, dim_base, 0);
+                            // ---- Prologue: fill sX_slot_0 (kt=0) + sR (kt=0) ----
+                            fill_sX_tile(sX_slot_0, 0);
+                            fill_sR_tile(dim_base, 0);
                             cutlass::arch::fence_view_async_shared();
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
@@ -743,44 +749,45 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const int k_base_next = (kt + 1) * 64;
                                 const bool has_next = (kt + 1) < k_tiles;
 
-                                // ---- Async wgmma consumes sR[kt & 1] ----
+                                // ---- Async wgmma reads sX_slot[kt&1] + sR ----
                                 if ((kt & 1) == 0) {
                                     gemm<false, 0>(
                                         tiled_mma_wg,
-                                        thr_mma_wg.partition_fragment_A(sX_tile),
-                                        thr_mma_wg.partition_fragment_B(sR_tile_0),
+                                        thr_mma_wg.partition_fragment_A(sX_slot_0),
+                                        thr_mma_wg.partition_fragment_B(sR_tile),
                                         rC
                                     );
                                 } else {
                                     gemm<false, 0>(
                                         tiled_mma_wg,
-                                        thr_mma_wg.partition_fragment_A(sX_tile),
-                                        thr_mma_wg.partition_fragment_B(sR_tile_1),
+                                        thr_mma_wg.partition_fragment_A(sX_slot_1),
+                                        thr_mma_wg.partition_fragment_B(sR_tile),
                                         rC
                                     );
                                 }
 
-                                // ---- Prefetch sR[(kt+1) & 1] overlap wgmma ----
-                                // sR double-buffer: writing the OTHER slot does not
-                                // race the in-flight wgmma reading sR[kt & 1].
+                                // ---- Prefetch sX(kt+1) into the OTHER slot,
+                                //      overlaps the in-flight wgmma. sX fill
+                                //      is the slow path (byte deref + header
+                                //      lookup + fmaf), now hidden by wgmma. ----
                                 if (has_next) {
                                     if (((kt + 1) & 1) == 0) {
-                                        fill_sR_tile(sR_tile_0, dim_base, k_base_next);
+                                        fill_sX_tile(sX_slot_0, k_base_next);
                                     } else {
-                                        fill_sR_tile(sR_tile_1, dim_base, k_base_next);
+                                        fill_sX_tile(sX_slot_1, k_base_next);
                                     }
                                 }
 
-                                // ---- Wait wgmma retire (frees sX for refill) ----
+                                // ---- Wait wgmma retire (releases sR). ----
                                 cute::warpgroup_wait<0>();
 
                                 if (has_next) {
-                                    // sX is single-buffer, must wait wgmma before refill.
-                                    fill_sX_tile(k_base_next);
-                                    // One barrier per kt (down from 2 in the legacy
-                                    // fill->fence->barrier->wgmma->barrier pattern):
-                                    // guards both sX (single-buf) and sR (double-buf)
-                                    // for the next iter's wgmma.
+                                    // sR is single-buffer; refill after wgmma
+                                    // retires. sR fill is __ldg fp32 (fast).
+                                    fill_sR_tile(dim_base, k_base_next);
+                                    // One barrier/kt: publishes both the newly
+                                    // prefetched sX_slot and the newly filled
+                                    // sR to the next wgmma issue.
                                     cutlass::arch::fence_view_async_shared();
                                     NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                                 }
