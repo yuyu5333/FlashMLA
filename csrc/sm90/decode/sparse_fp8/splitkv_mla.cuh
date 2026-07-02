@@ -628,18 +628,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // ==========================================================
                     // Bit-uniform parameters hoisted here so they are in scope
                     // for BOTH the wgmma_uniform_supported path below AND the
-                    // legacy fallback block that follows. Previously these were
-                    // declared inside the legacy block (around L919), causing
-                    // the wgmma path to reference `bu` before its declaration;
-                    // stale .o files masked the bug until a forced rebuild.
+                    // legacy fallback block that follows.
                     const int bu = params.bit_uniform;
                     const int u_groups = params.uniform_num_groups;
                     const int u_hdr_bytes = params.uniform_header_bytes;
                     const int u_group_size = params.uniform_group_size;
                     const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
 
-                    constexpr bool wgmma_uniform_supported =
-                        (MODEL_TYPE == ModelType::MODEL1) && (CLUSTER_SIZE == 1);
+                    // [DISABLED] wgmma R@X pipeline path — currently produces
+                    // wrong output (token salad) due to an unfixed functional
+                    // bug. Force-false to fall through to the verified legacy
+                    // path while the bug is investigated.
+                    constexpr bool wgmma_uniform_supported = false;
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
