@@ -236,11 +236,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                 bar_phase_k ^= 1<<buf_idx;
 
-                cute::warpgroup_wait<0>();
-                
-                // Calculate S = softmax(mask(scale(P)))
+                // [micro-opt B] Move sScale/sS free-barrier wait into QK wgmma
+                // async window (between commit_batch and wait<0>). Barrier
+                // arrive+wait is a non-matrix-pipe instruction, safe to issue
+                // while QK wgmma is still in flight, so the spin-wait overlaps
+                // with tensor-core compute instead of stalling after it.
                 if (block_idx != args.start_block_idx)
-                    NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);  // Make sure that sScale and sS is free
+                    NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);
+
+                cute::warpgroup_wait<0>();
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
                 scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
@@ -622,6 +626,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // bf16(rC) before staging->sK copy). sR_tile is a
                     // dedicated 8KB smem region (packed_r_tile).
                     // ==========================================================
+                    // Bit-uniform parameters hoisted here so they are in scope
+                    // for BOTH the wgmma_uniform_supported path below AND the
+                    // legacy fallback block that follows. Previously these were
+                    // declared inside the legacy block (around L919), causing
+                    // the wgmma path to reference `bu` before its declaration;
+                    // stale .o files masked the bug until a forced rebuild.
+                    const int bu = params.bit_uniform;
+                    const int u_groups = params.uniform_num_groups;
+                    const int u_hdr_bytes = params.uniform_header_bytes;
+                    const int u_group_size = params.uniform_group_size;
+                    const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
+
                     constexpr bool wgmma_uniform_supported =
                         (MODEL_TYPE == ModelType::MODEL1) && (CLUSTER_SIZE == 1);
 
@@ -916,11 +932,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // Barrier count per token drops from 4 to 2 (one
                     // after we fill s_x, one after R@x staging write
                     // before reusing s_x for the next t).
-                    const int bu = params.bit_uniform;
-                    const int u_groups = params.uniform_num_groups;  // 7 for MODEL1
-                    const int u_hdr_bytes = params.uniform_header_bytes;  // 28
-                    const int u_group_size = params.uniform_group_size;  // 64
-                    const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
+                    // (bu/u_groups/u_hdr_bytes/u_group_size/u_step_denom
+                    // are declared above, before the wgmma_uniform_supported
+                    // branch, so they are in scope here.)
 
                     CUTE_UNROLL
                     for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
