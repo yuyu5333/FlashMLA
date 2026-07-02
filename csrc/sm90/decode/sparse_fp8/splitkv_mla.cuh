@@ -627,12 +627,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
-                        // [Route G step 8 sX double-buffer]
+                        // [Route G step 9 direction A] wgmma pipeline via
+                        //   warpgroup_wait<1>: >=2 wgmma in-flight. Both sX
+                        //   and sR are double-buffered so refilling slot
+                        //   (kt+2) does not corrupt the still in-flight
+                        //   wgmma(kt+1) reads.
+                        //
                         //   sX_slot[0] aliases packed_nope_staging (also
                         //     dual-used later for rC scatter and staging->sK).
-                        //   sX_slot[1] lives in packed_x_alt_tile (wgmma-only,
-                        //     never scattered). 8+8=16 KB total for sX (net 0
-                        //     vs step7 since sR reverts to single-buffer).
+                        //   sX_slot[1] lives in packed_x_alt_tile.
+                        //   sR_slot[0] lives in packed_r_tile.
+                        //   sR_slot[1] lives in packed_r_alt_tile.
                         Tensor sX_slot_0 = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
                             SmemLayoutKTile{}
@@ -641,12 +646,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_x_alt_tile)),
                             SmemLayoutKTile{}
                         );
-                        // sR reverts to single-buffer (step7 sR double-buffer
-                        // was null-effect: sR fill is __ldg fp32, already in
-                        // wgmma shadow. Real bottleneck is sX fill, now
-                        // double-buffered above).
-                        Tensor sR_tile = make_tensor(
+                        Tensor sR_slot_0 = make_tensor(
                             make_smem_ptr(plan.packed_r_tile.data()),
+                            SmemLayoutKTile{}
+                        );
+                        Tensor sR_slot_1 = make_tensor(
+                            make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_r_alt_tile)),
                             SmemLayoutKTile{}
                         );
                         // Plain [64 tokens, 64 dim_out] view over the same 8KB
@@ -663,9 +668,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int k_tiles = qk_nope / 64;  // 7 for MODEL1
 
                         // Helper lambdas: fill sX/sR from global for a given k_base.
-                        // fill_sX_tile takes a sX destination tensor so it can
-                        // target either slot; fill_sR_tile targets the single
-                        // sR_tile.
+                        // Both take a destination tensor so they can target
+                        // either slot.
                         auto fill_sX_tile = [&](auto &sX_dst, int k_base) {
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
@@ -715,7 +719,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         };
 
-                        auto fill_sR_tile = [&](int dim_base, int k_base) {
+                        auto fill_sR_tile = [&](auto &sR_dst, int dim_base, int k_base) {
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int lin = e * 128 + idx_in_warpgroup;
@@ -726,7 +730,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const float r_val = __ldg(
                                     R_base + (int64_t)j_global * (int64_t)qk_nope + (int64_t)d_global
                                 );
-                                sR_tile(j, d) = bf16(r_val);
+                                sR_dst(j, d) = bf16(r_val);
                             }
                         };
 
@@ -739,59 +743,74 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             );
                             clear(rC);
 
-                            // ---- Prologue: fill sX_slot_0 (kt=0) + sR (kt=0) ----
+                            // ---- Prologue: fill sX_slot_0 + sR_slot_0 (kt=0) ----
+                            //   Also pre-fill sX_slot_1 + sR_slot_1 for kt=1 so
+                            //   the pipeline has two full buffers ready before
+                            //   entering the loop; the loop below can then
+                            //   issue wgmma(kt) then fill (kt+2) while wgmma(kt-1)
+                            //   is retired via wait<1>.
                             fill_sX_tile(sX_slot_0, 0);
-                            fill_sR_tile(dim_base, 0);
+                            fill_sR_tile(sR_slot_0, dim_base, 0);
+                            if (k_tiles > 1) {
+                                fill_sX_tile(sX_slot_1, 64);
+                                fill_sR_tile(sR_slot_1, dim_base, 64);
+                            }
                             cutlass::arch::fence_view_async_shared();
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                             for (int kt = 0; kt < k_tiles; ++kt) {
-                                const int k_base_next = (kt + 1) * 64;
-                                const bool has_next = (kt + 1) < k_tiles;
+                                const int k_base_next2 = (kt + 2) * 64;
+                                const bool has_next2 = (kt + 2) < k_tiles;
 
-                                // ---- Async wgmma reads sX_slot[kt&1] + sR ----
+                                // ---- Async wgmma reads sX_slot[kt&1] + sR_slot[kt&1] ----
                                 if ((kt & 1) == 0) {
                                     gemm<false, 0>(
                                         tiled_mma_wg,
                                         thr_mma_wg.partition_fragment_A(sX_slot_0),
-                                        thr_mma_wg.partition_fragment_B(sR_tile),
+                                        thr_mma_wg.partition_fragment_B(sR_slot_0),
                                         rC
                                     );
                                 } else {
                                     gemm<false, 0>(
                                         tiled_mma_wg,
                                         thr_mma_wg.partition_fragment_A(sX_slot_1),
-                                        thr_mma_wg.partition_fragment_B(sR_tile),
+                                        thr_mma_wg.partition_fragment_B(sR_slot_1),
                                         rC
                                     );
                                 }
 
-                                // ---- Prefetch sX(kt+1) into the OTHER slot,
-                                //      overlaps the in-flight wgmma. sX fill
-                                //      is the slow path (byte deref + header
-                                //      lookup + fmaf), now hidden by wgmma. ----
-                                if (has_next) {
-                                    if (((kt + 1) & 1) == 0) {
-                                        fill_sX_tile(sX_slot_0, k_base_next);
+                                // ---- Prefetch (kt+2) into slot[kt&1] while
+                                //      wgmma(kt) and wgmma(kt+1) can be in
+                                //      flight (wait<1> below only forces
+                                //      wgmma(kt-1) to retire). ----
+                                if (has_next2) {
+                                    if ((kt & 1) == 0) {
+                                        fill_sX_tile(sX_slot_0, k_base_next2);
+                                        fill_sR_tile(sR_slot_0, dim_base, k_base_next2);
                                     } else {
-                                        fill_sX_tile(sX_slot_1, k_base_next);
+                                        fill_sX_tile(sX_slot_1, k_base_next2);
+                                        fill_sR_tile(sR_slot_1, dim_base, k_base_next2);
                                     }
                                 }
 
-                                // ---- Wait wgmma retire (releases sR). ----
-                                cute::warpgroup_wait<0>();
+                                // ---- Wait: allow up to 1 wgmma in-flight.
+                                //      For kt >= 1 this forces wgmma(kt-1) to
+                                //      retire, releasing its sX/sR slot. For
+                                //      kt = 0 nothing prior exists so this
+                                //      degenerates to a no-op. ----
+                                cute::warpgroup_wait<1>();
 
-                                if (has_next) {
-                                    // sR is single-buffer; refill after wgmma
-                                    // retires. sR fill is __ldg fp32 (fast).
-                                    fill_sR_tile(dim_base, k_base_next);
-                                    // One barrier/kt: publishes both the newly
-                                    // prefetched sX_slot and the newly filled
-                                    // sR to the next wgmma issue.
+                                if (has_next2) {
+                                    // Publish freshly prefetched slot to the
+                                    // wgmma issue in a later kt.
                                     cutlass::arch::fence_view_async_shared();
                                     NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                                 }
                             }
+
+                            // ---- Drain the pipeline: wait for the last
+                            //      wgmma to retire before scattering rC. ----
+                            cute::warpgroup_wait<0>();
 
                             // ---- Scatter bf16(rC) into sStaging (aliased sX_tile) ----
                             // partition_C on the plain [64,64] staging tensor gives us

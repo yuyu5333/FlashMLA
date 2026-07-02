@@ -121,24 +121,32 @@ struct SharedMemoryPlan {
     //   Loaded from R_base per (dim_block, K-tile). Consumed by wgmma as B
     //   in MMA_64x64x16_F32BF16BF16_SS<K, K>.
     //
-    // [Route G step 8 revert to single-buffer] step 7 sR double-buffer was
-    //   null-effect (+0.3% tps): sR fill is pure __ldg fp32 already covered
-    //   by wgmma shadow. Reverting to single-buffer frees 8 KB smem for the
-    //   real bottleneck: sX fill (byte deref + header lookup + fmaf) which
-    //   must be double-buffered to hide behind wgmma.
+    // [Route G step 9 direction A] sR primary K-tile (was single-buffer in
+    //   step 8 after step 7 sR double-buffer was null-effect). Re-adding
+    //   packed_r_alt_tile below to allow wgmma pipelining via warpgroup_wait<1>
+    //   (>=2 wgmma in-flight). Rationale: without sR double-buffer, refilling
+    //   sR for iteration kt+2 would corrupt the still in-flight wgmma(kt+1)
+    //   read. Net smem vs step 8: +8 KB (adds packed_r_alt_tile); vs step 7
+    //   layout: adds packed_x_alt_tile (net +8 KB vs step 7).
     CUTE_ALIGNAS(128) array_aligned<bf16, cosize_v<SmemLayoutKTile>> packed_r_tile;
 
     // [Route G step 8 sX double-buffer] Alternate sX K-tile.
     //   packed_nope_staging holds sX_tile[0] (also dual-used for rC scatter
     //   / staging->sK copy). This buffer holds sX_tile[1] used ONLY during
-    //   the wgmma issue phase (no rC scatter alias here). Kt-loop pattern:
-    //     iter kt writes into sX_slot[(kt+1) & 1] while wgmma_(kt) still
-    //     reads sX_slot[kt & 1]. Barrier count drops from 1 barrier/kt
-    //     (step7) to 1 barrier per (kt+1) *after* the wgmma retires only
-    //     to make the freshly-filled sX visible; the wgmma of kt no longer
-    //     stalls the fill of kt+1. Net smem: -8 KB (sR single) + 8 KB
-    //     (sX_alt) = 0 KB (stays under 228 KB SM90 limit).
+    //   the wgmma issue phase (no rC scatter alias here).
     CUTE_ALIGNAS(128) bf16 packed_x_alt_tile[64 * 64];
+
+    // [Route G step 9 direction A] Alternate sR K-tile for wgmma pipelining.
+    //   Kt-loop with double-buffer sX + sR + warpgroup_wait<1>:
+    //     iter kt: issue wgmma(kt) reads sX_slot[kt&1] + sR_slot[kt&1];
+    //              then prefetch sX_slot[(kt+1)&1] + sR_slot[(kt+1)&1];
+    //              wait<1> allows wgmma(kt) still in flight (only wgmma(kt-1)
+    //              is forced to retire), so the *previous* iteration's mma
+    //              overlaps with fills of the *next-next* buffer.
+    //   Net smem vs step 8: +8 KB (this alt sR buffer). SharedMemoryPlan
+    //   total stays under 228 KB SM90 dyn smem limit (validated by step 7
+    //   build/capture at the same +8 KB delta).
+    CUTE_ALIGNAS(128) bf16 packed_r_alt_tile[64 * 64];
 };
 
 template<
