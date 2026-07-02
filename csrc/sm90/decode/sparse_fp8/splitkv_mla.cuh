@@ -757,34 +757,25 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             clear(rC);
 
                             // ---- Prologue: fill sX_slot_0 + sR_slot_0 (kt=0) ----
-                            //   Also pre-fill sX_slot_1 + sR_slot_1 for kt=1 so
-                            //   the pipeline has two full buffers ready before
-                            //   entering the loop; the loop below can then
-                            //   issue wgmma(kt) then fill (kt+2) while wgmma(kt-1)
-                            //   is retired via wait<1>.
                             fill_sX_tile(sX_slot_0, 0);
                             fill_sR_tile(sR_slot_0, dim_base, 0);
-                            if (k_tiles > 1) {
-                                fill_sX_tile(sX_slot_1, 64);
-                                fill_sR_tile(sR_slot_1, dim_base, 64);
-                            }
                             cutlass::arch::fence_view_async_shared();
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                             for (int kt = 0; kt < k_tiles; ++kt) {
-                                const int k_base_next2 = (kt + 2) * 64;
-                                const bool has_next2 = (kt + 2) < k_tiles;
+                                const bool has_next = (kt + 1) < k_tiles;
+                                const int k_base_next = (kt + 1) * 64;
 
                                 // ---- Async wgmma reads sX_slot[kt&1] + sR_slot[kt&1] ----
                                 if ((kt & 1) == 0) {
-                                    gemm<false, 0>(
+                                    gemm<false, -1>(
                                         tiled_mma_wg,
                                         thr_mma_wg.partition_fragment_A(sX_slot_0),
                                         thr_mma_wg.partition_fragment_B(sR_slot_0),
                                         rC
                                     );
                                 } else {
-                                    gemm<false, 0>(
+                                    gemm<false, -1>(
                                         tiled_mma_wg,
                                         thr_mma_wg.partition_fragment_A(sX_slot_1),
                                         thr_mma_wg.partition_fragment_B(sR_slot_1),
@@ -792,38 +783,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     );
                                 }
 
-                                // ---- Prefetch (kt+2) into slot[kt&1] while
-                                //      wgmma(kt) and wgmma(kt+1) can be in
-                                //      flight (wait<1> below only forces
-                                //      wgmma(kt-1) to retire). ----
-                                if (has_next2) {
+                                // ---- Overlap: fill next K-tile into the other
+                                //      slot while current wgmma is running ----
+                                if (has_next) {
                                     if ((kt & 1) == 0) {
-                                        fill_sX_tile(sX_slot_0, k_base_next2);
-                                        fill_sR_tile(sR_slot_0, dim_base, k_base_next2);
+                                        fill_sX_tile(sX_slot_1, k_base_next);
+                                        fill_sR_tile(sR_slot_1, dim_base, k_base_next);
                                     } else {
-                                        fill_sX_tile(sX_slot_1, k_base_next2);
-                                        fill_sR_tile(sR_slot_1, dim_base, k_base_next2);
+                                        fill_sX_tile(sX_slot_0, k_base_next);
+                                        fill_sR_tile(sR_slot_0, dim_base, k_base_next);
                                     }
-                                }
-
-                                // ---- Wait: allow up to 1 wgmma in-flight.
-                                //      For kt >= 1 this forces wgmma(kt-1) to
-                                //      retire, releasing its sX/sR slot. For
-                                //      kt = 0 nothing prior exists so this
-                                //      degenerates to a no-op. ----
-                                cute::warpgroup_wait<1>();
-
-                                if (has_next2) {
-                                    // Publish freshly prefetched slot to the
-                                    // wgmma issue in a later kt.
                                     cutlass::arch::fence_view_async_shared();
                                     NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                                 }
-                            }
 
-                            // ---- Drain the pipeline: wait for the last
-                            //      wgmma to retire before scattering rC. ----
-                            cute::warpgroup_wait<0>();
+                                // ---- Wait for current wgmma to complete ----
+                                cute::warpgroup_wait<0>();
+                            }
 
                             // ---- Scatter bf16(rC) into sStaging (aliased sX_tile) ----
                             // partition_C on the plain [64,64] staging tensor gives us
