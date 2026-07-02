@@ -805,7 +805,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             // Sync before reusing s_codes/s_x for the next token.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                         }
-                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                        // [Stage-5 Route G step7-cleanup] Removed a redundant
+                        // NamedBarrier here. The barrier inside the for-t loop
+                        // (post-R@x, pre next-iter s_x rewrite) already fires
+                        // on the t=63 iteration and synchronizes all 128
+                        // producer threads. All 64 staging[] entries are
+                        // guaranteed visible + globally consistent at loop
+                        // exit, so the extra sync before staging->sK read
+                        // was pure overhead (~50-100 cyc * 7 dim_blocks =
+                        // ~350-700 cyc per TOPK_BLOCK saved).
 
                         // ---- Step 2 + 3: per round, read staging to regs, write sK ----
                         CUTE_UNROLL
