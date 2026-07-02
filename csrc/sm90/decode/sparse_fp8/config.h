@@ -120,9 +120,16 @@ struct SharedMemoryPlan {
     //
     // packed_r_tile: [64 dims_out, 64 dims_in] bf16 K-major (SmemLayoutKTile).
     //   Loaded from R_base per (dim_block, K-tile). Consumed by wgmma as B
-    //   in MMA_64x64x16_F32BF16BF16_SS<K, K>. Net +8 KB (aliases nothing to
-    //   keep the SS wgmma descriptor stable across the 7-tile K reduction).
-    CUTE_ALIGNAS(128) array_aligned<bf16, cosize_v<SmemLayoutKTile>> packed_r_tile;
+    //   in MMA_64x64x16_F32BF16BF16_SS<K, K>.
+    //
+    // [Route G step 7 double-buffer] Sized as [2] to enable wgmma <-> fill
+    //   overlap across the kt loop. Iteration kt writes into packed_r_tile[
+    //   kt & 1] while wgmma_(kt-1) still reads packed_r_tile[(kt-1) & 1].
+    //   Net +8 KB (16 KB total). sX_tile remains single-buffer (aliases
+    //   packed_nope_staging, dual-use with rC scatter), so the pipeline
+    //   depth is 1: kt+1 fill sX only runs after warpgroup_wait<0> retires
+    //   the previous wgmma.
+    CUTE_ALIGNAS(128) array_aligned<bf16, cosize_v<SmemLayoutKTile>> packed_r_tile[2];
 };
 
 template<
