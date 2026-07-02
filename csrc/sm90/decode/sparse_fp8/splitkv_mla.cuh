@@ -588,6 +588,211 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }
                     }
 
+                    // ==========================================================
+                    // [M3.c.4 Stage-5 Route G step 4+5] wgmma R@X uniform-bit
+                    // path (MODEL1 + CLUSTER_SIZE==1 + bu > 0 only).
+                    //
+                    // Structural rewrite that replaces the per-token 4-barrier
+                    // storm of the legacy inner loop with a cooperative
+                    // 128-thread fill + tensor-core reduction:
+                    //
+                    //   for dim_block in 0..HEAD_DIM_NOPE/64:            (7)
+                    //     rC[64,64] = 0                                 (fp32)
+                    //     for kt in 0..qk_nope/64:                        (7)
+                    //       128 threads cooperatively fill:
+                    //         sX_tile[t=0..63, d=0..63] bf16              // unpack + affine
+                    //         sR_tile[j=0..63, d=0..63] bf16              // R[dim_base+j, kt*64+d]
+                    //       fence + NamedBarrier(128)
+                    //       wgmma MMA_64x64x16_F32BF16BF16_SS<K,K>:
+                    //         rC += sX_tile @ sR_tile^T                  // 4 issues of k16 per tile
+                    //       warpgroup_wait<0>
+                    //       NamedBarrier(128)                             // release sX/sR for kt+1
+                    //     scatter bf16(rC) -> staging via partition_C
+                    //     NamedBarrier(128)
+                    //     staging -> sK[dim_block tile] via 128-bit stores  (reused legacy path)
+                    //     NamedBarrier(128)
+                    //
+                    // Barrier count per TOPK_BLOCK: 7 * (7*2 + 2) = 112,
+                    //   vs legacy uniform 896 (~8x), vs var-bit 1792 (~16x).
+                    // R@X FLOPs stay identical but come from tensor cores
+                    //   (wgmma m64n64k16) instead of 128 lanes x 224 FMA.
+                    //
+                    // Preconditions: sX_tile aliases packed_nope_staging (8KB
+                    // reused as wgmma A during issue, then overwritten with
+                    // bf16(rC) before staging->sK copy). sR_tile is a
+                    // dedicated 8KB smem region (packed_r_tile).
+                    // ==========================================================
+                    constexpr bool wgmma_uniform_supported =
+                        (MODEL_TYPE == ModelType::MODEL1) && (CLUSTER_SIZE == 1);
+
+                    if constexpr (wgmma_uniform_supported) {
+                        if (bu > 0) {
+                        // sX_tile aliases the 8KB packed_nope_staging.
+                        Tensor sX_tile = make_tensor(
+                            make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
+                            SmemLayoutKTile{}
+                        );
+                        Tensor sR_tile = make_tensor(
+                            make_smem_ptr(plan.packed_r_tile.data()),
+                            SmemLayoutKTile{}
+                        );
+                        // Plain [64 tokens, 64 dim_out] view over the same 8KB
+                        // used to scatter bf16(rC) and to source 128-bit copies
+                        // to sK (byte-identical to the legacy staging path).
+                        Tensor sStaging = make_tensor(
+                            make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
+                            Layout<Shape<Int<64>, Int<64>>, Stride<Int<64>, _1>>{}
+                        );
+
+                        TiledMMA tiled_mma_wg = TiledMMA_QK{};
+                        ThrMMA thr_mma_wg = tiled_mma_wg.get_slice(idx_in_warpgroup);
+
+                        const int k_tiles = qk_nope / 64;  // 7 for MODEL1
+
+                        CUTE_UNROLL
+                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
+                            const int dim_base = dim_block * 64;
+
+                            Tensor rC = partition_fragment_C(
+                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
+                            );
+                            clear(rC);
+
+                            for (int kt = 0; kt < k_tiles; ++kt) {
+                                const int k_base = kt * 64;
+
+                                // ---- Fill sX_tile[t, d] cooperatively ----
+                                // 64*64 = 4096 elements / 128 threads = 32 elems/thread.
+                                // Linear index -> (t = lin/64, d = lin%64).
+                                CUTE_UNROLL
+                                for (int e = 0; e < 32; ++e) {
+                                    const int lin = e * 128 + idx_in_warpgroup;
+                                    const int t = lin >> 6;
+                                    const int d = lin & 63;
+                                    const int d_global = k_base + d;
+
+                                    const int token_index = __ldg(indices_base + t);
+                                    bool out_of_range = false;
+                                    if constexpr (MODEL_TYPE == ModelType::MODEL1) {
+                                        if (rel_block_idx * TOPK_BLOCK_SIZE + t >= topk_length) {
+                                            out_of_range = true;
+                                        }
+                                    }
+                                    const bool invalid = (token_index == -1) || out_of_range;
+
+                                    float x_val = 0.0f;
+                                    if (!invalid) {
+                                        const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
+                                        const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
+                                        const uint8_t* pk_row = pk_base
+                                            + block_index * pk_block_stride
+                                            + rel_idx_in_block * packed_row_bytes;
+
+                                        const int bit_off_global = d_global * bu;
+                                        const int byte_off = bit_off_global >> 3;
+                                        const int shift = bit_off_global & 7;
+                                        uint32_t word = (uint32_t)pk_row[byte_off];
+                                        word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
+                                        if (bu > 8) {
+                                            word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
+                                        }
+                                        const uint32_t mask = (1u << bu) - 1u;
+                                        const int code = (int)((word >> shift) & mask);
+
+                                        const int g = d_global / u_group_size;
+                                        const __half* hdr_h = reinterpret_cast<const __half*>(
+                                            pk_row + nope_bytes - u_hdr_bytes + g * 4
+                                        );
+                                        const float fmin = __half2float(hdr_h[0]);
+                                        const float frange = __half2float(hdr_h[1]);
+                                        const float fstep = frange * (1.0f / u_step_denom);
+                                        x_val = fmaf((float)code, fstep, fmin);
+                                    }
+                                    sX_tile(t, d) = bf16(x_val);
+                                }
+
+                                // ---- Fill sR_tile[j, d] cooperatively ----
+                                // R is stored row-major [qk_nope, qk_nope]: R[j, d]
+                                CUTE_UNROLL
+                                for (int e = 0; e < 32; ++e) {
+                                    const int lin = e * 128 + idx_in_warpgroup;
+                                    const int j = lin >> 6;
+                                    const int d = lin & 63;
+                                    const int j_global = dim_base + j;
+                                    const int d_global = k_base + d;
+                                    const float r_val = __ldg(
+                                        R_base + (int64_t)j_global * (int64_t)qk_nope + (int64_t)d_global
+                                    );
+                                    sR_tile(j, d) = bf16(r_val);
+                                }
+
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                // ---- wgmma K-tile reduction ----
+                                // MMA_64x64x16_F32BF16BF16_SS<K, K>: SmemLayoutKTile
+                                // gives (M=64, K=64) tile that partitions into 4 k-blocks
+                                // of k16. gemm<> unrolls k-mode and sets scale D=1 after
+                                // the first inner-issue, so `rC` accumulates over kt loop.
+                                gemm<false, 0>(
+                                    tiled_mma_wg,
+                                    thr_mma_wg.partition_fragment_A(sX_tile),
+                                    thr_mma_wg.partition_fragment_B(sR_tile),
+                                    rC
+                                );
+
+                                // Guard sX/sR reuse in the next kt iteration.
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            }
+
+                            // ---- Scatter bf16(rC) into sStaging (aliased sX_tile) ----
+                            // partition_C on the plain [64,64] staging tensor gives us
+                            // the exact per-thread MMA_C layout without any STSM helper.
+                            Tensor tC_sStaging = thr_mma_wg.partition_C(sStaging);
+                            CUTE_UNROLL
+                            for (int i = 0; i < size(rC); ++i) {
+                                tC_sStaging(i) = bf16(rC(i));
+                            }
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                            // ---- Reuse legacy staging -> sK 128-bit copy ----
+                            // Byte-identical to the tail of the legacy path so the
+                            // consumer WG sees the same sK layout.
+                            CUTE_UNROLL
+                            for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                                int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
+                                const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
+                                const int dim_in_block = (lane_idx / 8) * 16;
+
+                                bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
+                                    plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0
+                                );
+                                bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
+                                    plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8
+                                );
+
+                                bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                    + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
+
+                                int smem_offset_lo = (dim_base + 0) * TOPK_BLOCK_SIZE;
+                                int smem_offset_hi = (dim_base + 8) * TOPK_BLOCK_SIZE;
+                                *(__int128_t*)(sK_nope_base + smem_offset_lo) = *(__int128_t*)&val_lo;
+                                *(__int128_t*)(sK_nope_base + smem_offset_hi) = *(__int128_t*)&val_hi;
+                            }
+
+                            // Guard staging reuse in the next dim_block iteration.
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                        }
+
+                        cutlass::arch::fence_view_async_shared();
+                        // Fall through to shared bar_k_local_ready arrive +
+                        // is_kv_valid write below (outside the packed branch).
+                        }  // end if (bu > 0) inside wgmma_uniform_supported
+                    }
+
+                    if (!wgmma_uniform_supported || bu == 0) {
+
                     // [M3.c.4 Stage-5 Bug-3 fix] Per-token full unpack + affine
                     // + R@x dequant, with **unified barrier sequence** for both
                     // valid and invalid tokens.
@@ -845,6 +1050,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     }
 
                     fence_view_async_shared();
+                    }  // end if (!wgmma_uniform_supported || bu == 0) legacy path
                 } else {
                     // ---- Original dense FP8 K-load path ----
                 CUTE_UNROLL
