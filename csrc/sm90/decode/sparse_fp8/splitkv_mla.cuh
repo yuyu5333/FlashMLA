@@ -635,11 +635,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int u_group_size = params.uniform_group_size;
                     const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
 
-                    // [DISABLED] wgmma R@X pipeline path — currently produces
-                    // wrong output (token salad) due to an unfixed functional
-                    // bug. Force-false to fall through to the verified legacy
-                    // path while the bug is investigated.
-                    constexpr bool wgmma_uniform_supported = false;
+                    constexpr bool wgmma_uniform_supported =
+                        (MODEL_TYPE == ModelType::MODEL1) && (CLUSTER_SIZE == 1);
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
@@ -656,11 +653,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   sR_slot[1] lives in packed_r_alt_tile.
                         Tensor sX_slot_0 = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
-                            SmemLayoutKTile{}
+                            SmemLayoutXTile{}
                         );
                         Tensor sX_slot_1 = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_x_alt_tile)),
-                            SmemLayoutKTile{}
+                            SmemLayoutXTile{}
                         );
                         Tensor sR_slot_0 = make_tensor(
                             make_smem_ptr(plan.packed_r_tile.data()),

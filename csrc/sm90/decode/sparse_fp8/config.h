@@ -53,6 +53,11 @@ using SmemLayoutKTile = decltype(tile_to_shape(
     Step<_1, _2>{}
 ));
 
+using SmemLayoutXTile = decltype(tile_to_shape(
+    GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
+    Shape<Int<TOPK_BLOCK_SIZE>, _64>{}
+));
+
 template<int NUM_TILES>
 using SmemLayoutKTiles = decltype(tile_to_shape(
     SmemLayoutKTile{},
