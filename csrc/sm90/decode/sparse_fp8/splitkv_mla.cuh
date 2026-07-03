@@ -227,23 +227,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                 }
 
-#if ENABLE_QK_SPLIT_K
-                NamedBarrier::arrive(256, NamedBarriers::k_ready_for_wg1);
-
-                gemm_k_range<true, -1, true, true, 0, 18>(
-                    tiled_mma_QK,
-                    thr_mma_QK.partition_fragment_A(sQ),
-                    thr_mma_QK.partition_fragment_B(sK),
-                    rP
-                );
-#else
                 gemm<true, -1>(
                     tiled_mma_QK,
                     thr_mma_QK.partition_fragment_A(sQ),
                     thr_mma_QK.partition_fragment_B(sK),
                     rP
                 );
-#endif
 
                 bar_phase_k ^= 1<<buf_idx;
 
@@ -256,12 +245,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_free);
 
                 cute::warpgroup_wait<0>();
-
-#if ENABLE_QK_SPLIT_K
-                // Wait for WG1's QK_hi partial result and reduce
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::qk_partial_ready);
-                add_rP_from_rowmajor(rP, plan.partial_qk_hi, idx_in_warpgroup);
-#endif
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
                 scale_softmax<false>(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
@@ -396,15 +379,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     } else if (warpgroup_idx == 1) {
         cutlass::arch::warpgroup_reg_dealloc<192>();
 
-#if ENABLE_QK_SPLIT_K
-        TiledMMA tiled_mma_QK = TiledMMA_QK{};
-        ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
-#endif
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
-#if ENABLE_QK_SPLIT_K
-        Tensor rP_hi = partition_fragment_C(TiledMMA_QK{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
-#endif
         Tensor rO_lo = partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{});
         Tensor rO_hi = partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{});
 
@@ -417,27 +393,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
-                Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
                 Tensor sV_lo = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
                 Tensor sV_hi = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
-
-#if ENABLE_QK_SPLIT_K
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::k_ready_for_wg1);
-
-                gemm_k_range<true, -1, true, true, 18, 18>(
-                    tiled_mma_QK,
-                    thr_mma_QK.partition_fragment_A(sQ),
-                    thr_mma_QK.partition_fragment_B(sK),
-                    rP_hi
-                );
-
-                cute::warpgroup_wait<0>();
-
-                save_rP_rowmajor(rP_hi, plan.partial_qk_hi, idx_in_warpgroup);
-                fence_view_async_shared();
-
-                NamedBarrier::arrive(256, NamedBarriers::qk_partial_ready);
-#endif
 
                 // Wait for S and sScale
                 NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
