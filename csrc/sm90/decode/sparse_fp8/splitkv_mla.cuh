@@ -25,6 +25,7 @@ using cutlass::arch::NamedBarrier;
 using fp8_e8m0 = __nv_fp8_e8m0;
 
 template<
+    bool UpdateO = true,
     typename Tensor0,
     typename Tensor1,
     typename Tensor2
@@ -46,7 +47,6 @@ __forceinline__ __device__ void scale_softmax(
     for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
         Tensor cur_rP = flatten(rP(make_coord(_, local_row_idx, _), _, _));
         Tensor cur_rS = flatten(rS(make_coord(_, local_row_idx, _), _, _));
-        Tensor cur_rO = flatten(rO(make_coord(_, local_row_idx, _), _, _));
 
         float cur_max = -INFINITY;
         CUTE_UNROLL
@@ -64,9 +64,12 @@ __forceinline__ __device__ void scale_softmax(
         float scale_for_old = exp2f(old_max - rM[local_row_idx]);
         scale_for_olds[local_row_idx] = scale_for_old;
 
-        CUTE_UNROLL
-        for (int i = 0; i < size(cur_rO); ++i) {
-            cur_rO(i) *= scale_for_old;
+        if constexpr (UpdateO) {
+            Tensor cur_rO = flatten(rO(make_coord(_, local_row_idx, _), _, _)));
+            CUTE_UNROLL
+            for (int i = 0; i < size(cur_rO); ++i) {
+                cur_rO(i) *= scale_for_old;
+            }
         }
 
         float cur_sum = 0;
@@ -188,8 +191,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
         TiledMMA tiled_mma_QK = TiledMMA_QK{};
         ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
-        TiledMMA tiled_mma_PV = TiledMMA_PV_LocalP{};
-        ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
         
         float rL[2], rM[2];
         Tensor rO = partition_fragment_C(TiledMMA_PV_LocalP{}, Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{});
@@ -219,7 +220,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
-                Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
 
                 // Wait, issue WGMMA
                 plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
@@ -247,23 +247,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 cute::warpgroup_wait<0>();
 
                 // Since in our case TOPK_BLOCK_SIZE == BLOCK_M, so we only need to do OOB checking for the last 2 blocks
-                scale_softmax(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
+                scale_softmax<false>(rP, rS, rO, params.sm_scale_div_log2, sScale, rM, rL, plan.is_kv_valid[buf_idx], block_idx, idx_in_warpgroup);
 
                 // Store S into shared, inform warpgroup 1
                 save_rPb_to_sP(rS, sS, idx_in_warpgroup);
                 fence_view_async_shared();
 
-                // Issue O += S @ V
-                gemm<false, -1>(
-                    tiled_mma_PV,
-                    rS,
-                    thr_mma_PV.partition_fragment_B(sV),
-                    rO
-                );
-
+                // Signal WG1 early — sS and sScale are ready, WG1 can start PV immediately
+                // while we still have QK results in registers (no PV in WG0 anymore).
                 NamedBarrier::arrive(256, NamedBarriers::sScale_and_sS_ready);
-
-                cute::warpgroup_wait<0>();
 
                 if constexpr (CLUSTER_SIZE == 2) {
                     plan.bar_k_avail[buf_idx].arrive(0, idx_in_warpgroup == 32);
@@ -328,15 +320,22 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             
             int start_head_idx = head_block_idx*BLOCK_M;
             int num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M);
-            if (args.is_no_split) {
-                bf16* o_ptr = (bf16*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;	// (BLOCK_M, HEAD_DIM_V) : (params.stride_o_h_q, 1)
-                Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
-                    Shape<Int<BLOCK_M>, Int<HEAD_DIM_V>>{},
-                    make_stride(params.stride_o_h_q, _1{})
-                ));
-                float* gSoftmaxLse = (float*)params.lse + batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + start_head_idx;	// (BLOCK_M) : (1)
+            // WG0 no longer does PV_lo; WG1 handles both PV_lo and PV_hi.
+            // WG0 still participates in epilogue barrier and triggers TMA/bulk copy.
+            NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
 
-                store_o<true>(rO, gO, sOBuf, sOAccumBuf, plan, o_scales, tma_params, batch_idx, s_q_idx, head_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+            if (args.is_no_split) {
+                float* gSoftmaxLse = (float*)params.lse + batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + start_head_idx;
+
+                if (threadIdx.x == 0) {
+                    SM90_TMA_STORE_5D::copy(
+                        &tma_params.tensor_map_o,
+                        plan.u.oBuf.data(),
+                        0, head_block_idx*64, 0,
+                        s_q_idx, batch_idx
+                    );
+                    cute::tma_store_arrive();
+                }
 
                 int i = threadIdx.x;
                 if (i < num_valid_seq_q) {
@@ -348,13 +347,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             } else {
                 int n_split_idx = batch_idx == sched_meta.begin_req_idx ? sched_meta.begin_split_idx : 0;
                 int split_idx = __ldg(params.num_splits_ptr+batch_idx) + n_split_idx;
-                float* oaccum_ptr = (float*)params.o_accum + split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + start_head_idx*params.stride_o_accum_h_q;	// (BLOCK_M, HEAD_DIM_V) : (params.stride_o_accum_h_q, 1)
-                float* gSoftmaxLseAccum = (float*)params.lse_accum + split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + start_head_idx;	// (BLOCK_M) : (1)
+                float* oaccum_ptr = (float*)params.o_accum + split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + start_head_idx*params.stride_o_accum_h_q;
+                float* gSoftmaxLseAccum = (float*)params.lse_accum + split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + start_head_idx;
                 Tensor gOAccum = make_tensor(make_gmem_ptr(oaccum_ptr), make_layout(
                     Shape<Int<BLOCK_M>, Int<HEAD_DIM_V>>{},
                     make_stride(params.stride_o_accum_h_q, _1{})
                 ));
-                store_o<false>(rO, gOAccum, sOBuf, sOAccumBuf, plan, o_scales, tma_params, batch_idx, s_q_idx, head_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+
+                if (elect_one_sync()) {
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int local_row = 0; local_row < BLOCK_M / (256/32); ++local_row) {
+                        int row = local_row * (256/32) + (threadIdx.x / 32);
+                        if (row < num_valid_seq_q) {
+                            SM90_BULK_COPY_S2G::copy(&sOAccumBuf(row, _0{}), &gOAccum(row, _0{}), HEAD_DIM_V*sizeof(float));
+                        }
+                    }
+                    cute::tma_store_arrive();
+                }
 
                 int i = threadIdx.x;
                 if (i < num_valid_seq_q) {
@@ -368,43 +377,56 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        cutlass::arch::warpgroup_reg_dealloc<160>();
+        cutlass::arch::warpgroup_reg_dealloc<192>();
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
-        Tensor rO = partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{});
+        Tensor rO_lo = partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{});
+        Tensor rO_hi = partition_fragment_C(tiled_mma_PV, Shape<Int<BLOCK_M>, Int<HEAD_DIM_V/2>>{});
 
         #pragma unroll 1
         for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx) {
             MainloopArgs args = get_cur_req_info(batch_idx);
-            cute::fill(rO, 0.);
+            cute::fill(rO_lo, 0.);
+            cute::fill(rO_hi, 0.);
 
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
-                Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
+                Tensor sV_lo = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
+                Tensor sV_hi = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
                 // Wait for S and sScale
                 NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
 
-                // Scale O
+                // Scale O (both lo and hi accumulators)
                 float cur_scales[2];
                 *(float2*)cur_scales = *(float2*)(sScale + (idx_in_warpgroup/4)*2);
                 CUTE_UNROLL
                 for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
-                    Tensor cur_rO = flatten(rO(make_coord(_, local_row_idx, _), _, _));
+                    Tensor cur_rO_lo = flatten(rO_lo(make_coord(_, local_row_idx, _), _, _));
+                    Tensor cur_rO_hi = flatten(rO_hi(make_coord(_, local_row_idx, _), _, _));
                     CUTE_UNROLL
-                    for (int i = 0; i < size(cur_rO); ++i) {
-                        cur_rO(i) *= cur_scales[local_row_idx];
+                    for (int i = 0; i < size(cur_rO_lo); ++i) {
+                        cur_rO_lo(i) *= cur_scales[local_row_idx];
+                        cur_rO_hi(i) *= cur_scales[local_row_idx];
                     }
                 }
                 
-                // Issue O += S @ V, and wait
+                // Issue PV_lo: O_lo += S @ V_lo (first 256 V dims)
                 gemm<false, -1>(
                     tiled_mma_PV,
                     thr_mma_PV.partition_fragment_A(sS),
-                    thr_mma_PV.partition_fragment_B(sV),
-                    rO
+                    thr_mma_PV.partition_fragment_B(sV_lo),
+                    rO_lo
+                );
+
+                // Issue PV_hi: O_hi += S @ V_hi (second 256 V dims)
+                gemm<false, -1>(
+                    tiled_mma_PV,
+                    thr_mma_PV.partition_fragment_A(sS),
+                    thr_mma_PV.partition_fragment_B(sV_hi),
+                    rO_hi
                 );
                 cute::warpgroup_wait<0>();
                 
@@ -430,25 +452,59 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 
             int start_head_idx = head_block_idx*BLOCK_M;
             int num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M);
+            // WG1 does both PV_lo and PV_hi. Write both halves to smem, then barrier.
+            // WG0 triggers the final TMA/bulk copy to global.
             if (args.is_no_split) {
-                bf16* o_ptr = (bf16*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;	// (BLOCK_M, HEAD_DIM_V) : (params.stride_o_h_q, 1)
-                Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
-                    Shape<Int<BLOCK_M>, Int<HEAD_DIM_V>>{},
-                    make_stride(params.stride_o_h_q, _1{})
-                ));
+                // Write lo half (warpgroup_idx 0 position) and hi half (warpgroup_idx 1 position)
+                CUTE_UNROLL
+                for (int wg_half = 0; wg_half < 2; ++wg_half) {
+                    Tensor sMyOutputBuf = local_tile(sOBuf, Shape<_64, _256>{}, make_coord(_0{}, wg_half));
+                    constexpr int NUM_CHUNKS_IN_SW_ATOM = OBUF_SW/16;
+                    bf16* base_output_buf_ptrs[NUM_CHUNKS_IN_SW_ATOM];
+                    CUTE_UNROLL
+                    for (int i = 0; i < NUM_CHUNKS_IN_SW_ATOM; ++i) {
+                        base_output_buf_ptrs[i] = &sMyOutputBuf((idx_in_warpgroup/32)*16+idx_in_warpgroup%16, idx_in_warpgroup%32/16*8 + i*16);
+                    }
+                    auto& rO_cur = (wg_half == 0) ? rO_lo : rO_hi;
+                    CUTE_UNROLL
+                    for (int idx = 0; idx < (HEAD_DIM_V/2)/16; idx += 1) {
+                        using bf16x2 = __nv_bfloat162;
+                        bf16x2 a01 = __float22bfloat162_rn(float2{rO_cur(idx*8+0)*o_scales[0], rO_cur(idx*8+1)*o_scales[0]});
+                        bf16x2 a23 = __float22bfloat162_rn(float2{rO_cur(idx*8+2)*o_scales[1], rO_cur(idx*8+3)*o_scales[1]});
+                        bf16x2 a45 = __float22bfloat162_rn(float2{rO_cur(idx*8+4)*o_scales[0], rO_cur(idx*8+5)*o_scales[0]});
+                        bf16x2 a67 = __float22bfloat162_rn(float2{rO_cur(idx*8+6)*o_scales[1], rO_cur(idx*8+7)*o_scales[1]});
+                        SM90_U32x4_STSM_N::copy(
+                            *reinterpret_cast<uint32_t*>(&a01),
+                            *reinterpret_cast<uint32_t*>(&a23),
+                            *reinterpret_cast<uint32_t*>(&a45),
+                            *reinterpret_cast<uint32_t*>(&a67),
+                            *reinterpret_cast<uint128_t*>(base_output_buf_ptrs[idx%4] + (idx/4*4)*16*64)
+                        );
+                    }
+                }
 
-                store_o<true>(rO, gO, sOBuf, sOAccumBuf, plan, o_scales, tma_params, batch_idx, s_q_idx, head_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+                cutlass::arch::fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
 
                 cute::tma_store_wait<0>();
             } else {
-                int n_split_idx = batch_idx == sched_meta.begin_req_idx ? sched_meta.begin_split_idx : 0;
-                int split_idx = __ldg(params.num_splits_ptr+batch_idx) + n_split_idx;
-                float* oaccum_ptr = (float*)params.o_accum + split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + start_head_idx*params.stride_o_accum_h_q;	// (BLOCK_M, HEAD_DIM_V) : (params.stride_o_accum_h_q, 1)
-                Tensor gOAccum = make_tensor(make_gmem_ptr(oaccum_ptr), make_layout(
-                    Shape<Int<BLOCK_M>, Int<HEAD_DIM_V>>{},
-                    make_stride(params.stride_o_accum_h_q, _1{})
-                ));
-                store_o<false>(rO, gOAccum, sOBuf, sOAccumBuf, plan, o_scales, tma_params, batch_idx, s_q_idx, head_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
+                // Split mode: write both lo and hi halves to sOAccumBuf
+                CUTE_UNROLL
+                for (int wg_half = 0; wg_half < 2; ++wg_half) {
+                    auto& rO_cur = (wg_half == 0) ? rO_lo : rO_hi;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int idx = 0; idx < size(rO_cur); idx += 2) {
+                        int row = (idx_in_warpgroup/32)*16 + (idx_in_warpgroup%32/4) + (idx%4 >= 2 ? 8 : 0);
+                        int col = wg_half*256 + (idx_in_warpgroup%4)*2 + idx/4*8;
+                        *(float2*)(&(sOAccumBuf(row, col))) = float2 {
+                            rO_cur(idx) * o_scales[idx%4>=2],
+                            rO_cur(idx+1) * o_scales[idx%4>=2],
+                        };
+                    }
+                }
+                cutlass::arch::fence_view_async_shared();
+
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
 
                 cute::tma_store_wait<0>();
             }
