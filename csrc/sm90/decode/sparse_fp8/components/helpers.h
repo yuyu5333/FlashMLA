@@ -52,6 +52,7 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
 
+#if ENABLE_QK_SPLIT_K
 template <bool zero_init=false, int wg_wait=0, bool arrive=true, bool commit=true, int k_start=0, int k_count=-1, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 __forceinline__ __device__ void gemm_k_range(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
     constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
@@ -83,6 +84,7 @@ __forceinline__ __device__ void gemm_k_range(TiledMma &tiled_mma, Tensor0 const 
     warpgroup_fence_operand(tCrC);
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }
+#endif
 
 template<
     typename TMA,

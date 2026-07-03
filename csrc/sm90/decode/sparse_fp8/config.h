@@ -153,7 +153,9 @@ struct SharedMemoryPlan {
     //   build/capture at the same +8 KB delta).
     CUTE_ALIGNAS(128) bf16 packed_r_alt_tile[64 * 64];
 
+#if ENABLE_QK_SPLIT_K
     CUTE_ALIGNAS(128) float partial_qk_hi[BLOCK_M * TOPK_BLOCK_SIZE];
+#endif
 };
 
 template<
@@ -185,6 +187,8 @@ using TiledMMA_PV_RemoteP = decltype(make_tiled_mma(
 ));
 
 
+static constexpr bool ENABLE_QK_SPLIT_K = false;
+
 enum NamedBarriers : uint32_t {
     sScale_and_sS_ready = 0,
     sScale_and_sS_free = 1,
@@ -193,8 +197,10 @@ enum NamedBarriers : uint32_t {
     batch_loop_sync = 4,
     warpgroup0_sync = 5,
     packed_kv_producer_sync = 6,
+#if ENABLE_QK_SPLIT_K
     qk_partial_ready = 7,
     k_ready_for_wg1 = 8
+#endif
 };
 
 
@@ -228,6 +234,7 @@ static __forceinline__ __device__ void save_rPb_to_sP(
     cute::copy(r2s_copy, thr_copy_rPb, thr_copy_sP);
 }
 
+#if ENABLE_QK_SPLIT_K
 template<typename TensorR>
 static __forceinline__ __device__ void save_rP_rowmajor(
     TensorR const &rP,
@@ -263,6 +270,7 @@ static __forceinline__ __device__ void add_rP_from_rowmajor(
         }
     }
 }
+#endif
 
 
 template<
