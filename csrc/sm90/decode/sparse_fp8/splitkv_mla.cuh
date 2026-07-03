@@ -65,7 +65,7 @@ __forceinline__ __device__ void scale_softmax(
         scale_for_olds[local_row_idx] = scale_for_old;
 
         if constexpr (UpdateO) {
-            Tensor cur_rO = flatten(rO(make_coord(_, local_row_idx, _), _, _)));
+            Tensor cur_rO = flatten(rO(make_coord(_, local_row_idx, _), _, _));
             CUTE_UNROLL
             for (int i = 0; i < size(cur_rO); ++i) {
                 cur_rO(i) *= scale_for_old;
