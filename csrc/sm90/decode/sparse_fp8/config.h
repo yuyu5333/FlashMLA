@@ -152,6 +152,8 @@ struct SharedMemoryPlan {
     //   total stays under 228 KB SM90 dyn smem limit (validated by step 7
     //   build/capture at the same +8 KB delta).
     CUTE_ALIGNAS(128) bf16 packed_r_alt_tile[64 * 64];
+
+    CUTE_ALIGNAS(128) float partial_qk_hi[BLOCK_M * TOPK_BLOCK_SIZE];
 };
 
 template<
@@ -190,7 +192,8 @@ enum NamedBarriers : uint32_t {
     epilogue_r2s_ready = 3,
     batch_loop_sync = 4,
     warpgroup0_sync = 5,
-    packed_kv_producer_sync = 6
+    packed_kv_producer_sync = 6,
+    qk_partial_ready = 7
 };
 
 
@@ -222,6 +225,42 @@ static __forceinline__ __device__ void save_rPb_to_sP(
     Tensor thr_copy_rPb = thr_copy.retile_S(rPb);
     Tensor thr_copy_sP = thr_copy.partition_D(sP);
     cute::copy(r2s_copy, thr_copy_rPb, thr_copy_sP);
+}
+
+template<typename TensorR>
+static __forceinline__ __device__ void save_rP_rowmajor(
+    TensorR const &rP,
+    float *smem_rowmajor,
+    int idx_in_warpgroup
+) {
+    CUTE_UNROLL
+    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+        int row = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+        auto cur_rP = flatten(rP(make_coord(_, local_row_idx, _), _, _));
+        CUTE_UNROLL
+        for (int i = 0; i < size(cur_rP); ++i) {
+            int col = (i/2)*8 + (idx_in_warpgroup%4)*2 + (i&1);
+            smem_rowmajor[row * TOPK_BLOCK_SIZE + col] = cur_rP(i);
+        }
+    }
+}
+
+template<typename TensorR>
+static __forceinline__ __device__ void add_rP_from_rowmajor(
+    TensorR &rP,
+    float const *smem_rowmajor,
+    int idx_in_warpgroup
+) {
+    CUTE_UNROLL
+    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+        int row = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+        auto cur_rP = flatten(rP(make_coord(_, local_row_idx, _), _, _));
+        CUTE_UNROLL
+        for (int i = 0; i < size(cur_rP); ++i) {
+            int col = (i/2)*8 + (idx_in_warpgroup%4)*2 + (i&1);
+            cur_rP(i) += smem_rowmajor[row * TOPK_BLOCK_SIZE + col];
+        }
+    }
 }
 
 
