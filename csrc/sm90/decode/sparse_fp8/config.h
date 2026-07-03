@@ -193,7 +193,8 @@ enum NamedBarriers : uint32_t {
     batch_loop_sync = 4,
     warpgroup0_sync = 5,
     packed_kv_producer_sync = 6,
-    qk_partial_ready = 7
+    qk_partial_ready = 7,
+    k_ready_for_wg1 = 8
 };
 
 

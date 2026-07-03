@@ -227,6 +227,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                 }
 
+                NamedBarrier::arrive(256, NamedBarriers::k_ready_for_wg1);
+
                 gemm_k_range<true, -1, true, true, 0, 18>(
                     tiled_mma_QK,
                     thr_mma_QK.partition_fragment_A(sQ),
@@ -404,10 +406,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor sV_lo = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
                 Tensor sV_hi = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
-                plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
-                if constexpr (CLUSTER_SIZE == 2) {
-                    plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
-                }
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::k_ready_for_wg1);
 
                 gemm_k_range<true, -1, true, true, 18, 18>(
                     tiled_mma_QK,
@@ -415,8 +414,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     thr_mma_QK.partition_fragment_B(sK),
                     rP_hi
                 );
-
-                bar_phase_k ^= 1<<buf_idx;
 
                 cute::warpgroup_wait<0>();
 
