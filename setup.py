@@ -120,7 +120,12 @@ ext_modules.append(
                 "--use_fast_math",
                 "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
                 "-lineinfo",
-                "--source-in-ptx",
+                # NOTE: --source-in-ptx removed. It embeds the CUDA source text
+                # (which contains non-ASCII CJK comments in the sparse_fp8
+                # kernel) into the PTX, and ptxas rejects "Unexpected non-ASCII
+                # character" on those lines. -lineinfo alone (no source text) is
+                # kept for profiler line attribution. Pure debug-tooling flag,
+                # no effect on kernel correctness or performance.
             ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),
         },
         include_dirs=[
