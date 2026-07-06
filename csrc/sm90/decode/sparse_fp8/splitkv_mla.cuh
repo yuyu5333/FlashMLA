@@ -6,7 +6,15 @@
 //   is intentionally salad; this only measures the full-load decode tps
 //   ceiling to confirm the reconstruction chain is the 1-block/SM
 //   latency-bound bottleneck. Comment out for the byte-correct step1 path.
-#define FMLA_FOLD_ROT_PROBE 1
+//
+// [Route H step2a RESULT] Probe measured full-load 32-req decode tps = 19.54,
+//   IDENTICAL to step1 byte-correct (19.53). Skipping the entire producer R@X
+//   wgmma reconstruction gave ZERO tps gain -> the "per-K-block R@X rebuild is
+//   the main bottleneck" hypothesis is DISPROVEN. Bottleneck is NOT producer
+//   compute (consumer WG QK/PV chain + 1-block/SM low-occupancy + barrier sync
+//   dominate). Probe DISABLED; default is the byte-correct step1 #else path.
+//   Keep the guarded probe branch for future A/B comparison.
+// #define FMLA_FOLD_ROT_PROBE 1
 
 #include "splitkv_mla.h"
 
