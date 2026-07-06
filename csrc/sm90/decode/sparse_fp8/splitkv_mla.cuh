@@ -175,6 +175,8 @@ template<ModelType MODEL_TYPE, int NUM_HEADS>
 template<typename TMAParams>
 __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+    // [DEBUG] early exit to bisect illegal instruction
+    return;
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
     const int partition_idx = blockIdx.z;
