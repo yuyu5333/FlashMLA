@@ -274,6 +274,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     if (warpgroup_idx == 0) {
         cutlass::arch::warpgroup_reg_alloc<192>();
 
+        // [DEBUG] early return before main loop to bisect illegal instruction
+        return;
+
         TiledMMA tiled_mma_QK = TiledMMA_QK{};
         ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
         
@@ -479,6 +482,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
     } else if (warpgroup_idx == 1) {
         cutlass::arch::warpgroup_reg_dealloc<192>();
+
+        // [DEBUG] early return before main loop to bisect illegal instruction
+        return;
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
