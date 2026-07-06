@@ -175,8 +175,6 @@ template<ModelType MODEL_TYPE, int NUM_HEADS>
 template<typename TMAParams>
 __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
-    // [DEBUG] early exit to bisect illegal instruction
-    return;
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
     const int partition_idx = blockIdx.z;
@@ -673,8 +671,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // When packed_kcache_ptr is set, we read packed INT-N rows,
                 // bit-unpack + affine + R@x on the fly, and write BF16 to sK.
                 // Extra KV blocks always use the dense path.
-                const bool use_packed =
-                    !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
+                // [DEBUG] force disable packed path to bisect illegal instruction
+                const bool use_packed = false;
 
                 if (use_packed) {
                     // ---- Packed FP8 K-load path (S2-S2 fused dequant) ----
