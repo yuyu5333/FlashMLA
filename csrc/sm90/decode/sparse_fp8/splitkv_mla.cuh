@@ -16,6 +16,28 @@
 //   Keep the guarded probe branch for future A/B comparison.
 // #define FMLA_FOLD_ROT_PROBE 1
 
+// [Route H step3b] producer NULL-WORK PERF PROBE toggle.
+//   When defined, the packed producer skips ALL nope reconstruction
+//   (bit-unpack + affine + R@X wgmma/legacy + staging->sK). Only the
+//   rope direct-copy and the buffer handshake (bar_k_avail wait /
+//   bar_k_local_ready arrive / is_kv_valid write) survive; sK nope stays
+//   uninitialized so the output is intentionally salad.
+//
+//   Rationale (step3 static analysis): step2a only removed the producer
+//   wgmma MATH yet kept the byte-unpack + 14 NamedBarriers + staging->sK,
+//   and step1-vs-step2a shows the producer GLOBAL-LOAD volume (2464 vs
+//   224 loads/thread) also does not move tps. Neither is a controlled
+//   variable experiment for the producer's FIXED STRUCTURAL cost (barrier
+//   handshake + 7-dim_block serial skeleton + staging). This probe zeroes
+//   that entire cost in one cut:
+//     tps stays ~19.5 -> producer is NOT the bottleneck at all
+//       (consumer WG QK/PV chain or wall+drop_shadow multi-pool schedule);
+//     tps jumps       -> the producer's fixed skeleton IS the bottleneck.
+//   Occupancy lever is physically ruled out: SmemPlan ~180KB/block, 2
+//   blocks need 360KB > 228KB SM90 dyn-smem cap, and __launch_bounds__
+//   pins minBlocksPerSM=1. So this bisection is the only remaining cut.
+#define FMLA_PRODUCER_NULL_PROBE 1
+
 #include "splitkv_mla.h"
 
 #include <cuda_fp8.h>
@@ -701,6 +723,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // Bit-uniform parameters hoisted here so they are in scope
                     // for BOTH the wgmma_uniform_supported path below AND the
                     // legacy fallback block that follows.
+#ifndef FMLA_PRODUCER_NULL_PROBE
                     const int bu = params.bit_uniform;
                     const int u_groups = params.uniform_num_groups;
                     const int u_hdr_bytes = params.uniform_header_bytes;
@@ -1285,6 +1308,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     fence_view_async_shared();
                     }  // end if (!wgmma_uniform_supported || bu == 0) legacy path
+#else
+                    // [Route H step3b] producer null-work: nope reconstruction
+                    // skipped entirely; only rope-copy above + handshake below
+                    // survive. Keep the async-proxy fence so consumer wgmma
+                    // reads of sK are ordered after the rope stores.
+                    fence_view_async_shared();
+#endif  // FMLA_PRODUCER_NULL_PROBE (skips all nope reconstruction)
                 } else {
                     // ---- Original dense FP8 K-load path ----
                 CUTE_UNROLL
