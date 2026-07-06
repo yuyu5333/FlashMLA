@@ -803,74 +803,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         };
 
-                        CUTE_UNROLL
-                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
-                            const int dim_base = dim_block * 64;
-
-                            Tensor rC = partition_fragment_C(
-                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
-                            );
-                            clear(rC);
-
-                            // ---- Prologue: fill sX_slot_0 + sR_slot_0 (kt=0) ----
-                            fill_sX_tile(sX_slot_0, 0);
-                            fill_sR_tile(sR_slot_0, dim_base, 0);
-                            cutlass::arch::fence_view_async_shared();
-                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                            for (int kt = 0; kt < k_tiles; ++kt) {
-                                const bool has_next = (kt + 1) < k_tiles;
-                                const int k_base_next = (kt + 1) * 64;
-
-                                // ---- Async wgmma reads sX_slot[kt&1] + sR_slot[kt&1] ----
-                                if ((kt & 1) == 0) {
-                                    gemm<false, -1>(
-                                        tiled_mma_wg,
-                                        thr_mma_wg.partition_fragment_A(sX_slot_0),
-                                        thr_mma_wg.partition_fragment_B(sR_slot_0),
-                                        rC
-                                    );
-                                } else {
-                                    gemm<false, -1>(
-                                        tiled_mma_wg,
-                                        thr_mma_wg.partition_fragment_A(sX_slot_1),
-                                        thr_mma_wg.partition_fragment_B(sR_slot_1),
-                                        rC
-                                    );
-                                }
-
-                                // ---- Overlap: fill next K-tile into the other
-                                //      slot while current wgmma is running ----
-                                if (has_next) {
-                                    if ((kt & 1) == 0) {
-                                        fill_sX_tile(sX_slot_1, k_base_next);
-                                        fill_sR_tile(sR_slot_1, dim_base, k_base_next);
-                                    } else {
-                                        fill_sX_tile(sX_slot_0, k_base_next);
-                                        fill_sR_tile(sR_slot_0, dim_base, k_base_next);
-                                    }
-                                    cutlass::arch::fence_view_async_shared();
-                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-                                }
-
-                                // ---- Wait for current wgmma to complete ----
-                                cute::warpgroup_wait<0>();
-                            }
-
-                            // ---- Scatter bf16(rC) into sStaging (aliased sX_tile) ----
-                            // partition_C on the plain [64,64] staging tensor gives us
-                            // the exact per-thread MMA_C layout without any STSM helper.
+                        // ---- Scatter one rC fragment into sStaging then copy
+                        //      to GMMA-layout sK for a given dim_base. Byte-
+                        //      identical smem layout to the legacy tail. ----
+                        auto scatter_rC_to_sK = [&](auto &rC_frag, int dim_base) {
                             Tensor tC_sStaging = thr_mma_wg.partition_C(sStaging);
                             CUTE_UNROLL
-                            for (int i = 0; i < size(rC); ++i) {
-                                tC_sStaging(i) = bf16(rC(i));
+                            for (int i = 0; i < size(rC_frag); ++i) {
+                                tC_sStaging(i) = bf16(rC_frag(i));
                             }
                             cutlass::arch::fence_view_async_shared();
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
-                            // ---- Reuse legacy staging -> sK 128-bit copy ----
-                            // Byte-identical to the tail of the legacy path so the
-                            // consumer WG sees the same sK layout.
                             CUTE_UNROLL
                             for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
                                 int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
@@ -893,8 +837,115 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 *(__int128_t*)(sK_nope_base + smem_offset_hi) = *(__int128_t*)&val_hi;
                             }
 
-                            // Guard staging reuse in the next dim_block iteration.
+                            // Guard staging reuse before the next scatter / dim_block.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                        };
+
+                        // [Route H step 1] Group dim_blocks by 2. sX(kt) depends
+                        //   ONLY on kt (reduction dim), not on dim_block, so the
+                        //   expensive bit-unpack + affine dequant of sX is SHARED
+                        //   by both dim_blocks in a group. This cuts sX unpacks
+                        //   from 49 (7 dim_block x 7 kt) to 28 (4 groups x 7 kt),
+                        //   -43% exposed global-load latency (dmon proved this
+                        //   kernel is SM-stall / latency bound, mem=0%).
+                        //
+                        //   Buffers (no new smem vs step 9):
+                        //     sX_slot_0/sX_slot_1: double-buffered sX across kt
+                        //       (pipeline: fill sX(kt+1) into the free slot while
+                        //        wgmma(kt) is in flight -- keeps the EXPENSIVE
+                        //        unpack overlapped with the tensor core).
+                        //     sR_slot_0: sR(db0, kt);  sR_slot_1: sR(db1, kt).
+                        //       sR is a plain __ldg (no unpack) so it is only
+                        //       single-buffered per kt (refilled in place after
+                        //       warpgroup_wait<0>).
+                        //   rC0/rC1 are independent accumulators (2x32 fp32/thread,
+                        //   under the 152-reg producer budget).
+                        CUTE_UNROLL
+                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; dim_block += 2) {
+                            const int dim_base0 = dim_block * 64;
+                            const int dim_base1 = (dim_block + 1) * 64;
+                            const bool has_db1 = (dim_block + 1) < (HEAD_DIM_NOPE / 64);
+
+                            Tensor rC0 = partition_fragment_C(
+                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
+                            );
+                            Tensor rC1 = partition_fragment_C(
+                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
+                            );
+                            clear(rC0);
+                            if (has_db1) clear(rC1);
+
+                            // ---- Prologue: fill sX(kt=0) once + sR(db0/db1, kt=0) ----
+                            fill_sX_tile(sX_slot_0, 0);
+                            fill_sR_tile(sR_slot_0, dim_base0, 0);
+                            if (has_db1) fill_sR_tile(sR_slot_1, dim_base1, 0);
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                            for (int kt = 0; kt < k_tiles; ++kt) {
+                                const bool has_next = (kt + 1) < k_tiles;
+                                const int k_base_next = (kt + 1) * 64;
+
+                                // ---- wgmma: both dim_blocks read the SAME sX slot ----
+                                if ((kt & 1) == 0) {
+                                    gemm<false, -1>(
+                                        tiled_mma_wg,
+                                        thr_mma_wg.partition_fragment_A(sX_slot_0),
+                                        thr_mma_wg.partition_fragment_B(sR_slot_0),
+                                        rC0
+                                    );
+                                    if (has_db1) {
+                                        gemm<false, -1>(
+                                            tiled_mma_wg,
+                                            thr_mma_wg.partition_fragment_A(sX_slot_0),
+                                            thr_mma_wg.partition_fragment_B(sR_slot_1),
+                                            rC1
+                                        );
+                                    }
+                                } else {
+                                    gemm<false, -1>(
+                                        tiled_mma_wg,
+                                        thr_mma_wg.partition_fragment_A(sX_slot_1),
+                                        thr_mma_wg.partition_fragment_B(sR_slot_0),
+                                        rC0
+                                    );
+                                    if (has_db1) {
+                                        gemm<false, -1>(
+                                            tiled_mma_wg,
+                                            thr_mma_wg.partition_fragment_A(sX_slot_1),
+                                            thr_mma_wg.partition_fragment_B(sR_slot_1),
+                                            rC1
+                                        );
+                                    }
+                                }
+
+                                // ---- Pipeline the EXPENSIVE sX unpack: fill
+                                //      sX(kt+1) into the OTHER slot while wgmma
+                                //      (kt) is still in flight (sX_next is not
+                                //      read by wgmma(kt)). ----
+                                if (has_next) {
+                                    if ((kt & 1) == 0) {
+                                        fill_sX_tile(sX_slot_1, k_base_next);
+                                    } else {
+                                        fill_sX_tile(sX_slot_0, k_base_next);
+                                    }
+                                }
+
+                                // ---- Drain wgmma(kt) so sR slots are free to
+                                //      refill in place (sR single-buffered). ----
+                                cute::warpgroup_wait<0>();
+
+                                if (has_next) {
+                                    fill_sR_tile(sR_slot_0, dim_base0, k_base_next);
+                                    if (has_db1) fill_sR_tile(sR_slot_1, dim_base1, k_base_next);
+                                    cutlass::arch::fence_view_async_shared();
+                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                                }
+                            }
+
+                            // ---- Tail: scatter each rC -> staging -> sK ----
+                            scatter_rC_to_sK(rC0, dim_base0);
+                            if (has_db1) scatter_rC_to_sK(rC1, dim_base1);
                         }
 
                         cutlass::arch::fence_view_async_shared();
