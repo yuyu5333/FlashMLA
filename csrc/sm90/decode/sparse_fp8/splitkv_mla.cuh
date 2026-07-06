@@ -1,5 +1,13 @@
 #pragma once
 
+// [Route H step2a] fold-rotation PERF PROBE toggle.
+//   When defined, the packed producer skips the per-K-block R@X wgmma
+//   reconstruction and writes raw unpacked X straight to sK nope. Output
+//   is intentionally salad; this only measures the full-load decode tps
+//   ceiling to confirm the reconstruction chain is the 1-block/SM
+//   latency-bound bottleneck. Comment out for the byte-correct step1 path.
+#define FMLA_FOLD_ROT_PROBE 1
+
 #include "splitkv_mla.h"
 
 #include <cuda_fp8.h>
@@ -860,6 +868,62 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //       warpgroup_wait<0>).
                         //   rC0/rC1 are independent accumulators (2x32 fp32/thread,
                         //   under the 152-reg producer budget).
+#ifdef FMLA_FOLD_ROT_PROBE
+                        // ==================================================
+                        // [Route H step2a] fold-rotation PERF PROBE.
+                        //
+                        // Skip the per-K-block R@X wgmma reconstruction
+                        // entirely. For each output nope tile just unpack the
+                        // aligned code tile X[:, dim_base:dim_base+64] into
+                        // plain staging and copy it straight to sK nope.
+                        //
+                        // This is the producer cost after fold-rotation:
+                        //   7 unpacks + 7 staging->sK copies, ZERO wgmma.
+                        //
+                        // Output is INTENTIONALLY salad (Q is not pre-rotated
+                        // by R, O is not post-rotated by R^T). This build only
+                        // measures the full-load 32-req decode tps CEILING to
+                        // confirm/refute that the reconstruction chain is the
+                        // 1-block/SM latency-bound bottleneck. Correctness is
+                        // restored in step2b via host-side Q@R + O@R^T.
+                        // ==================================================
+                        CUTE_UNROLL
+                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
+                            const int dim_base = dim_block * 64;
+
+                            // Unpack raw X for the code tile aligned with this
+                            // output tile, straight into plain staging.
+                            fill_sX_tile(sStaging, dim_base);
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                            // staging -> sK nope (byte-identical to the legacy
+                            // 128-bit copy tail used by scatter_rC_to_sK).
+                            CUTE_UNROLL
+                            for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                                int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
+                                const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
+                                const int dim_in_block = (lane_idx / 8) * 16;
+
+                                bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
+                                    plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0
+                                );
+                                bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
+                                    plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8
+                                );
+
+                                bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                    + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
+
+                                int smem_offset_lo = (dim_base + 0) * TOPK_BLOCK_SIZE;
+                                int smem_offset_hi = (dim_base + 8) * TOPK_BLOCK_SIZE;
+                                *(__int128_t*)(sK_nope_base + smem_offset_lo) = *(__int128_t*)&val_lo;
+                                *(__int128_t*)(sK_nope_base + smem_offset_hi) = *(__int128_t*)&val_hi;
+                            }
+
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                        }
+#else
                         CUTE_UNROLL
                         for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; dim_block += 2) {
                             const int dim_base0 = dim_block * 64;
@@ -947,6 +1011,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             scatter_rC_to_sK(rC0, dim_base0);
                             if (has_db1) scatter_rC_to_sK(rC1, dim_base1);
                         }
+#endif  // FMLA_FOLD_ROT_PROBE
 
                         cutlass::arch::fence_view_async_shared();
                         // Fall through to shared bar_k_local_ready arrive +
