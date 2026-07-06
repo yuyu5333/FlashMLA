@@ -92,7 +92,11 @@ namespace sm90::decode::sparse_fp8 {
 //   [5]: number of accumulated (block) samples (only slot used for both WGs;
 //        producer counts into 5, consumer into 6, so we can normalize each).
 //   Slot 7 unused / padding.
-inline __device__ unsigned long long g_fmla_clk[8];
+//   NOTE: static (not inline) __device__ -> each instantiation TU gets its
+//   own copy. Safe because the kernel and its host run() readback live in the
+//   same TU per (MODEL_TYPE, NUM_HEADS) instantiation. inline __device__ is
+//   rejected under whole-program mode (-rdc=false).
+static __device__ unsigned long long g_fmla_clk[8];
 
 static __forceinline__ __device__ void fmla_clk_add(int seg, unsigned long long dt) {
     // Only one representative lane per warpgroup logs, to avoid 128x inflation.
