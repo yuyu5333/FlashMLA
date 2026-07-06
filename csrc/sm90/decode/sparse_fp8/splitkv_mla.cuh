@@ -836,7 +836,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   of 2-at-a-time, no fill-wgmma overlap).
                         Tensor sX_tile = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
-                            SmemLayoutXTile{}
+                            SmemLayoutKTile{}
                         );
                         Tensor sR_tile = make_tensor(
                             make_smem_ptr(plan.packed_r_tile.data()),
@@ -973,6 +973,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     rC
                                 );
                                 cute::warpgroup_wait<0>();
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                             }
 
                             scatter_rC_to_sK(rC, dim_base);
