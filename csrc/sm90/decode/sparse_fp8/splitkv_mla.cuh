@@ -804,8 +804,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int u_group_size = params.uniform_group_size;
                     const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
 
-                    constexpr bool wgmma_uniform_supported =
-                        (MODEL_TYPE == ModelType::MODEL1) && (CLUSTER_SIZE == 1);
+                    // [DEBUG] force-disable wgmma uniform path to bisect illegal instruction
+                    constexpr bool wgmma_uniform_supported = false;
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
