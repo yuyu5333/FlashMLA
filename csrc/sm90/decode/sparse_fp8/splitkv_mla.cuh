@@ -36,10 +36,34 @@
 //   Occupancy lever is physically ruled out: SmemPlan ~180KB/block, 2
 //   blocks need 360KB > 228KB SM90 dyn-smem cap, and __launch_bounds__
 //   pins minBlocksPerSM=1. So this bisection is the only remaining cut.
-#define FMLA_PRODUCER_NULL_PROBE 1
+//
+// [Route H step3b RESULT] Probe measured full-load 32-req decode tps =
+//   19.54/19.54/19.53, IDENTICAL to step2a (19.54) and step1 (19.53).
+//   Zeroing the ENTIRE producer nope reconstruction (unpack + 14 barriers
+//   + staging->sK + wgmma) gave ZERO tps gain. Combined with step1 (load
+//   dedup, no effect) and step2a (wgmma-skip, no effect), the producer WG
+//   is FULLY EXONERATED across three independent negative experiments.
+//   Bottleneck is definitively NOT the producer. Pivot: consumer WG QK/PV
+//   chain (inside flashmla) vs wall+drop_shadow multi-pool schedule
+//   (outside flashmla) -- isolated next by a baseline template-A native
+//   FP8 canary on the identical workload. Probe DISABLED.
+// #define FMLA_PRODUCER_NULL_PROBE 1
+
+// [Route H step3k] in-kernel clock64 SEGMENT PROFILE toggle.
+//   When defined, one representative thread per block accumulates clock64()
+//   deltas for the packed producer + consumer critical-path segments into a
+//   __device__ global counter array. Host run() throttled-prints the mean
+//   cycles/block/segment to stderr. Byte-correct (only adds clock64 reads +
+//   atomicAdds; the compute path is untouched). Purpose: split the 3.4x
+//   use_packed inner-loop (step3j) into producer bar-wait / rope-copy / nope
+//   rebuild vs consumer bar-wait / QK+softmax so we know which segment to
+//   optimize next. Comment out for the byte-correct production build (adds no
+//   counters).
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
+#include <cstdio>
 #include <cuda_fp8.h>
 #include <math_constants.h>
 #include <cutlass/barrier.h>
@@ -56,6 +80,25 @@
 using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
+
+#ifdef FMLA_CLK_PROFILE
+// [Route H step3k] segment cycle counters (device global).
+//   Index layout:
+//     0: producer bar_k_avail.wait   (empty-wait for buffer free)
+//     1: producer rope-copy          (per-token scattered 268B rope read)
+//     2: producer nope rebuild       (bit-unpack + affine + R@X wgmma/legacy)
+//     3: consumer bar_k_local_ready.wait (empty-wait for producer)
+//     4: consumer QK + softmax       (wgmma QK + scale_softmax + save)
+//   [5]: number of accumulated (block) samples (only slot used for both WGs;
+//        producer counts into 5, consumer into 6, so we can normalize each).
+//   Slot 7 unused / padding.
+inline __device__ unsigned long long g_fmla_clk[8];
+
+static __forceinline__ __device__ void fmla_clk_add(int seg, unsigned long long dt) {
+    // Only one representative lane per warpgroup logs, to avoid 128x inflation.
+    atomicAdd(&g_fmla_clk[seg], dt);
+}
+#endif
 
 static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
@@ -260,10 +303,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
 
                 // Wait, issue WGMMA
+#ifdef FMLA_CLK_PROFILE
+                unsigned long long _clk_c0 = clock64();
+#endif
                 plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                 if constexpr (CLUSTER_SIZE == 2) {
                     plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                 }
+#ifdef FMLA_CLK_PROFILE
+                unsigned long long _clk_c1 = clock64();
+                if (idx_in_warpgroup == 0) fmla_clk_add(3, _clk_c1 - _clk_c0);
+#endif
 
                 gemm<true, -1>(
                     tiled_mma_QK,
@@ -290,6 +340,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // Store S into shared, inform warpgroup 1
                 save_rPb_to_sP(rS, sS, idx_in_warpgroup);
                 fence_view_async_shared();
+#ifdef FMLA_CLK_PROFILE
+                {
+                    unsigned long long _clk_c2 = clock64();
+                    if (idx_in_warpgroup == 0) {
+                        fmla_clk_add(4, _clk_c2 - _clk_c1);
+                        fmla_clk_add(6, 1ull);  // consumer block sample count
+                    }
+                }
+#endif
 
                 // Signal WG1 early — sS and sScale are ready, WG1 can start PV immediately
                 // while we still have QK results in registers (no PV in WG0 anymore).
@@ -639,7 +698,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     bf16* staging = plan.packed_nope_staging;
 
                     // Wait for the nope buffer to be available
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p0 = clock64();
+#endif
                     plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p1 = clock64();
+                    if (idx_in_warpgroup == 0) fmla_clk_add(0, _clk_p1 - _clk_p0);
+#endif
 
                     if (CLUSTER_SIZE == 2 && idx_in_warpgroup == 0) {
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
@@ -685,6 +751,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         }
                     }
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p2 = clock64();
+                    if (idx_in_warpgroup == 0) fmla_clk_add(1, _clk_p2 - _clk_p1);
+#endif
 
                     // ==========================================================
                     // [M3.c.4 Stage-5 Route G step 4+5] wgmma R@X uniform-bit
@@ -1315,6 +1385,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // reads of sK are ordered after the rope stores.
                     fence_view_async_shared();
 #endif  // FMLA_PRODUCER_NULL_PROBE (skips all nope reconstruction)
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p3 = clock64();
+                    if (idx_in_warpgroup == 0) {
+                        fmla_clk_add(2, _clk_p3 - _clk_p2);
+                        fmla_clk_add(5, 1ull);  // producer block sample count
+                    }
+#endif
                 } else {
                     // ---- Original dense FP8 K-load path ----
                 CUTE_UNROLL
@@ -1595,6 +1672,33 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         launch_params, (void*)mla_kernel, params, tma_params
     );
     KU_CHECK_KERNEL_LAUNCH();
+
+#ifdef FMLA_CLK_PROFILE
+    // [Route H step3k] throttled readback of the segment cycle counters.
+    //   Print mean cycles/block/segment every N launches, then zero the
+    //   accumulators. N chosen so decode-loop noise averages out while
+    //   staying human-readable in the server log.
+    {
+        static thread_local unsigned long long _fmla_launch_ctr = 0;
+        constexpr unsigned long long PRINT_EVERY = 500ull;
+        if ((++_fmla_launch_ctr % PRINT_EVERY) == 0) {
+            unsigned long long h[8] = {0};
+            cudaMemcpyFromSymbol(h, g_fmla_clk, sizeof(h));
+            unsigned long long np = h[5] ? h[5] : 1ull;  // producer samples
+            unsigned long long nc = h[6] ? h[6] : 1ull;  // consumer samples
+            double p0 = (double)h[0] / np, p1 = (double)h[1] / np, p2 = (double)h[2] / np;
+            double c3 = (double)h[3] / nc, c4 = (double)h[4] / nc;
+            fprintf(stderr,
+                "[FMLA_CLK step3k] launch#%llu np=%llu nc=%llu | "
+                "PROD bar_avail=%.0f rope=%.0f nope_rebuild=%.0f | "
+                "CONS bar_ready=%.0f QK_softmax=%.0f (cyc/block)\n",
+                _fmla_launch_ctr, np, nc, p0, p1, p2, c3, c4);
+            fflush(stderr);
+            unsigned long long z[8] = {0};
+            cudaMemcpyToSymbol(g_fmla_clk, z, sizeof(z));
+        }
+    }
+#endif
 }
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
