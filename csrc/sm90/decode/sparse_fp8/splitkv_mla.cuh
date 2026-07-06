@@ -59,7 +59,7 @@
 //   rebuild vs consumer bar-wait / QK+softmax so we know which segment to
 //   optimize next. Comment out for the byte-correct production build (adds no
 //   counters).
-#define FMLA_CLK_PROFILE 1
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
@@ -836,7 +836,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   of 2-at-a-time, no fill-wgmma overlap).
                         Tensor sX_tile = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
-                            SmemLayoutKTile{}
+                            SmemLayoutXTile{}
                         );
                         Tensor sR_tile = make_tensor(
                             make_smem_ptr(plan.packed_r_tile.data()),
