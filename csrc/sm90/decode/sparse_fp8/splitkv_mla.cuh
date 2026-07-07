@@ -231,9 +231,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
     if (sched_meta.begin_req_idx >= params.b) return;
 
-    // [DEBUG] early return after sched_meta check to bisect illegal instruction
-    return;
-
     if (warp_idx == 0 && elect_one_sync()) {
         Tensor gQ = flat_divide(
             tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, sched_meta.begin_req_idx),
@@ -244,6 +241,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     }
 
     ku::barrier_cluster_wait_acquire();
+
+    // [DEBUG] early return after barrier_cluster_wait_acquire to bisect illegal instruction
+    return;
 
     struct MainloopArgs {
         int start_block_idx, end_block_idx;
