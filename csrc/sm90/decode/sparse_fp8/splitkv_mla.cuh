@@ -272,8 +272,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     };
 
     if (warpgroup_idx == 0) {
-        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
-        // cutlass::arch::warpgroup_reg_alloc<192>();
+        // [L3] setmaxnreg restored to step14 3fd2816 known-good values.
+        //   single-buffer producer has <= register pressure than the
+        //   double-buffer step14, so dealloc<152> in the producer branch is
+        //   a legal decrease relative to the ptxas baseline. WG0 QK+softmax.
+        cutlass::arch::warpgroup_reg_alloc<192>();
 
         TiledMMA tiled_mma_QK = TiledMMA_QK{};
         ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
@@ -479,8 +482,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
-        // cutlass::arch::warpgroup_reg_dealloc<192>();
+        // [L3] setmaxnreg restored (step14 known-good). WG1 PV GEMM.
+        cutlass::arch::warpgroup_reg_dealloc<192>();
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
@@ -616,8 +619,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
     } else {
         // Producer warpgroup
-        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
-        // cutlass::arch::warpgroup_reg_dealloc<152>();
+        // [L3] setmaxnreg restored (step14 known-good). KV load + dequant.
+        cutlass::arch::warpgroup_reg_dealloc<152>();
 
         static_assert(CLUSTER_SIZE == 1 || CLUSTER_SIZE == 2);
         static constexpr int NUM_TOKENS_PER_THREAD = CLUSTER_SIZE == 1 ? 2 : 1;
