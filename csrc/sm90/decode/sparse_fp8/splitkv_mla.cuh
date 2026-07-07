@@ -269,8 +269,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     };
 
     if (warpgroup_idx == 0) {
-        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
-        // cutlass::arch::warpgroup_reg_alloc<192>();
+        cutlass::arch::warpgroup_reg_alloc<192>();
 
         TiledMMA tiled_mma_QK = TiledMMA_QK{};
         ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
@@ -470,8 +469,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
-        // cutlass::arch::warpgroup_reg_dealloc<160>();
+        cutlass::arch::warpgroup_reg_dealloc<160>();
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
@@ -560,8 +558,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
     } else {
         // Producer warpgroup
-        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
-        // cutlass::arch::warpgroup_reg_dealloc<152>();
+        cutlass::arch::warpgroup_reg_dealloc<152>();
 
         static_assert(CLUSTER_SIZE == 1 || CLUSTER_SIZE == 2);
         static constexpr int NUM_TOKENS_PER_THREAD = CLUSTER_SIZE == 1 ? 2 : 1;
