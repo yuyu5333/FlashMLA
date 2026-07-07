@@ -272,11 +272,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     };
 
     if (warpgroup_idx == 0) {
-        // [DEBUG] disable reg_alloc to test if setmaxnreg is the illegal instruction
-        // cutlass::arch::warpgroup_reg_alloc<192>();
-
-        // [DEBUG] early return before main loop to bisect illegal instruction
-        return;
+        cutlass::arch::warpgroup_reg_alloc<192>();
 
         TiledMMA tiled_mma_QK = TiledMMA_QK{};
         ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
@@ -482,11 +478,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        // [DEBUG] disable reg_dealloc to test if setmaxnreg is the illegal instruction
-        // cutlass::arch::warpgroup_reg_dealloc<192>();
-
-        // [DEBUG] early return before main loop to bisect illegal instruction
-        return;
+        cutlass::arch::warpgroup_reg_dealloc<192>();
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
@@ -679,8 +671,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // When packed_kcache_ptr is set, we read packed INT-N rows,
                 // bit-unpack + affine + R@x on the fly, and write BF16 to sK.
                 // Extra KV blocks always use the dense path.
-                // [DEBUG] force disable packed path to bisect illegal instruction
-                const bool use_packed = false;
+                const bool use_packed =
+                    !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
 
                 if (use_packed) {
                     // ---- Packed FP8 K-load path (S2-S2 fused dequant) ----
@@ -812,8 +804,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int u_group_size = params.uniform_group_size;
                     const float u_step_denom = (bu > 0) ? float((1 << bu) - 1) : 1.0f;
 
-                    // [DEBUG] force-disable wgmma uniform path to bisect illegal instruction
-                    constexpr bool wgmma_uniform_supported = false;
+                    constexpr bool wgmma_uniform_supported =
+                        (MODEL_TYPE == ModelType::MODEL1) && (CLUSTER_SIZE == 1);
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
