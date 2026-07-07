@@ -1483,16 +1483,6 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     );
     KU_CHECK_KERNEL_LAUNCH();
 
-    // [DEBUG] Force synchronous error check to pinpoint illegal instruction.
-    {
-        cudaError_t _e = cudaStreamSynchronize(params.stream);
-        if (_e != cudaSuccess) {
-            fprintf(stderr, "[DEBUG step3k] mla_kernel sync error: %s at %s:%d\n",
-                cudaGetErrorString(_e), __FILE__, __LINE__);
-            fflush(stderr);
-        }
-    }
-
 #ifdef FMLA_CLK_PROFILE
     // [Route H step3k] throttled readback of the segment cycle counters.
     //   Print mean cycles/block/segment every N launches, then zero the
