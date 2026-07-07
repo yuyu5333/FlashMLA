@@ -1,7 +1,69 @@
 #pragma once
 
+// [Route H step2a] fold-rotation PERF PROBE toggle.
+//   When defined, the packed producer skips the per-K-block R@X wgmma
+//   reconstruction and writes raw unpacked X straight to sK nope. Output
+//   is intentionally salad; this only measures the full-load decode tps
+//   ceiling to confirm the reconstruction chain is the 1-block/SM
+//   latency-bound bottleneck. Comment out for the byte-correct step1 path.
+//
+// [Route H step2a RESULT] Probe measured full-load 32-req decode tps = 19.54,
+//   IDENTICAL to step1 byte-correct (19.53). Skipping the entire producer R@X
+//   wgmma reconstruction gave ZERO tps gain -> the "per-K-block R@X rebuild is
+//   the main bottleneck" hypothesis is DISPROVEN. Bottleneck is NOT producer
+//   compute (consumer WG QK/PV chain + 1-block/SM low-occupancy + barrier sync
+//   dominate). Probe DISABLED; default is the byte-correct step1 #else path.
+//   Keep the guarded probe branch for future A/B comparison.
+// #define FMLA_FOLD_ROT_PROBE 1
+
+// [Route H step3b] producer NULL-WORK PERF PROBE toggle.
+//   When defined, the packed producer skips ALL nope reconstruction
+//   (bit-unpack + affine + R@X wgmma/legacy + staging->sK). Only the
+//   rope direct-copy and the buffer handshake (bar_k_avail wait /
+//   bar_k_local_ready arrive / is_kv_valid write) survive; sK nope stays
+//   uninitialized so the output is intentionally salad.
+//
+//   Rationale (step3 static analysis): step2a only removed the producer
+//   wgmma MATH yet kept the byte-unpack + 14 NamedBarriers + staging->sK,
+//   and step1-vs-step2a shows the producer GLOBAL-LOAD volume (2464 vs
+//   224 loads/thread) also does not move tps. Neither is a controlled
+//   variable experiment for the producer's FIXED STRUCTURAL cost (barrier
+//   handshake + 7-dim_block serial skeleton + staging). This probe zeroes
+//   that entire cost in one cut:
+//     tps stays ~19.5 -> producer is NOT the bottleneck at all
+//       (consumer WG QK/PV chain or wall+drop_shadow multi-pool schedule);
+//     tps jumps       -> the producer's fixed skeleton IS the bottleneck.
+//   Occupancy lever is physically ruled out: SmemPlan ~180KB/block, 2
+//   blocks need 360KB > 228KB SM90 dyn-smem cap, and __launch_bounds__
+//   pins minBlocksPerSM=1. So this bisection is the only remaining cut.
+//
+// [Route H step3b RESULT] Probe measured full-load 32-req decode tps =
+//   19.54/19.54/19.53, IDENTICAL to step2a (19.54) and step1 (19.53).
+//   Zeroing the ENTIRE producer nope reconstruction (unpack + 14 barriers
+//   + staging->sK + wgmma) gave ZERO tps gain. Combined with step1 (load
+//   dedup, no effect) and step2a (wgmma-skip, no effect), the producer WG
+//   is FULLY EXONERATED across three independent negative experiments.
+//   Bottleneck is definitively NOT the producer. Pivot: consumer WG QK/PV
+//   chain (inside flashmla) vs wall+drop_shadow multi-pool schedule
+//   (outside flashmla) -- isolated next by a baseline template-A native
+//   FP8 canary on the identical workload. Probe DISABLED.
+// #define FMLA_PRODUCER_NULL_PROBE 1
+
+// [Route H step3k] in-kernel clock64 SEGMENT PROFILE toggle.
+//   When defined, one representative thread per block accumulates clock64()
+//   deltas for the packed producer + consumer critical-path segments into a
+//   __device__ global counter array. Host run() throttled-prints the mean
+//   cycles/block/segment to stderr. Byte-correct (only adds clock64 reads +
+//   atomicAdds; the compute path is untouched). Purpose: split the 3.4x
+//   use_packed inner-loop (step3j) into producer bar-wait / rope-copy / nope
+//   rebuild vs consumer bar-wait / QK+softmax so we know which segment to
+//   optimize next. Comment out for the byte-correct production build (adds no
+//   counters).
+// #define FMLA_CLK_PROFILE 1
+
 #include "splitkv_mla.h"
 
+#include <cstdio>
 #include <cuda_fp8.h>
 #include <math_constants.h>
 #include <cutlass/barrier.h>
@@ -18,6 +80,29 @@
 using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
+
+#ifdef FMLA_CLK_PROFILE
+// [Route H step3k] segment cycle counters (device global).
+//   Index layout:
+//     0: producer bar_k_avail.wait   (empty-wait for buffer free)
+//     1: producer rope-copy          (per-token scattered 268B rope read)
+//     2: producer nope rebuild       (bit-unpack + affine + R@X wgmma/legacy)
+//     3: consumer bar_k_local_ready.wait (empty-wait for producer)
+//     4: consumer QK + softmax       (wgmma QK + scale_softmax + save)
+//   [5]: number of accumulated (block) samples (only slot used for both WGs;
+//        producer counts into 5, consumer into 6, so we can normalize each).
+//   Slot 7 unused / padding.
+//   NOTE: static (not inline) __device__ -> each instantiation TU gets its
+//   own copy. Safe because the kernel and its host run() readback live in the
+//   same TU per (MODEL_TYPE, NUM_HEADS) instantiation. inline __device__ is
+//   rejected under whole-program mode (-rdc=false).
+static __device__ unsigned long long g_fmla_clk[8];
+
+static __forceinline__ __device__ void fmla_clk_add(int seg, unsigned long long dt) {
+    // Only one representative lane per warpgroup logs, to avoid 128x inflation.
+    atomicAdd(&g_fmla_clk[seg], dt);
+}
+#endif
 
 static constexpr float MAX_INIT_VAL = -1e30;    // Prevent (-inf) - (-inf) = nan
 using cutlass::arch::fence_view_async_shared;
@@ -187,7 +272,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     };
 
     if (warpgroup_idx == 0) {
-        cutlass::arch::warpgroup_reg_alloc<192>();
+        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
+        // cutlass::arch::warpgroup_reg_alloc<192>();
 
         TiledMMA tiled_mma_QK = TiledMMA_QK{};
         ThrMMA thr_mma_QK = tiled_mma_QK.get_slice(idx_in_warpgroup);
@@ -222,10 +308,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
 
                 // Wait, issue WGMMA
+#ifdef FMLA_CLK_PROFILE
+                unsigned long long _clk_c0 = clock64();
+#endif
                 plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                 if constexpr (CLUSTER_SIZE == 2) {
                     plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
                 }
+#ifdef FMLA_CLK_PROFILE
+                unsigned long long _clk_c1 = clock64();
+                if (idx_in_warpgroup == 0) fmla_clk_add(3, _clk_c1 - _clk_c0);
+#endif
 
                 gemm<true, -1>(
                     tiled_mma_QK,
@@ -252,6 +345,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // Store S into shared, inform warpgroup 1
                 save_rPb_to_sP(rS, sS, idx_in_warpgroup);
                 fence_view_async_shared();
+#ifdef FMLA_CLK_PROFILE
+                {
+                    unsigned long long _clk_c2 = clock64();
+                    if (idx_in_warpgroup == 0) {
+                        fmla_clk_add(4, _clk_c2 - _clk_c1);
+                        fmla_clk_add(6, 1ull);  // consumer block sample count
+                    }
+                }
+#endif
 
                 // Signal WG1 early — sS and sScale are ready, WG1 can start PV immediately
                 // while we still have QK results in registers (no PV in WG0 anymore).
@@ -377,7 +479,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        cutlass::arch::warpgroup_reg_dealloc<192>();
+        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
+        // cutlass::arch::warpgroup_reg_dealloc<192>();
 
         TiledMMA tiled_mma_PV = TiledMMA_PV_RemoteP{};
         ThrMMA thr_mma_PV = tiled_mma_PV.get_slice(idx_in_warpgroup);
@@ -513,7 +616,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         }
     } else {
         // Producer warpgroup
-        cutlass::arch::warpgroup_reg_dealloc<152>();
+        // [DEBUG L1b] setmaxnreg disabled to test register-budget hypothesis
+        // cutlass::arch::warpgroup_reg_dealloc<152>();
 
         static_assert(CLUSTER_SIZE == 1 || CLUSTER_SIZE == 2);
         static constexpr int NUM_TOKENS_PER_THREAD = CLUSTER_SIZE == 1 ? 2 : 1;
@@ -570,6 +674,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // When packed_kcache_ptr is set, we read packed INT-N rows,
                 // bit-unpack + affine + R@x on the fly, and write BF16 to sK.
                 // Extra KV blocks always use the dense path.
+                // [DEBUG L2] packed real path re-enabled, setmaxnreg still off
                 const bool use_packed =
                     !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
 
@@ -601,7 +706,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     bf16* staging = plan.packed_nope_staging;
 
                     // Wait for the nope buffer to be available
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p0 = clock64();
+#endif
                     plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p1 = clock64();
+                    if (idx_in_warpgroup == 0) fmla_clk_add(0, _clk_p1 - _clk_p0);
+#endif
 
                     if (CLUSTER_SIZE == 2 && idx_in_warpgroup == 0) {
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
@@ -647,6 +759,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         }
                     }
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p2 = clock64();
+                    if (idx_in_warpgroup == 0) fmla_clk_add(1, _clk_p2 - _clk_p1);
+#endif
 
                     // ==========================================================
                     // [M3.c.4 Stage-5 Route G step 4+5] wgmma R@X uniform-bit
@@ -685,6 +801,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     // Bit-uniform parameters hoisted here so they are in scope
                     // for BOTH the wgmma_uniform_supported path below AND the
                     // legacy fallback block that follows.
+#ifndef FMLA_PRODUCER_NULL_PROBE
                     const int bu = params.bit_uniform;
                     const int u_groups = params.uniform_num_groups;
                     const int u_hdr_bytes = params.uniform_header_bytes;
@@ -696,36 +813,39 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     if constexpr (wgmma_uniform_supported) {
                         if (bu > 0) {
-                        // [Route G step 9 direction A] wgmma pipeline via
-                        //   warpgroup_wait<1>: >=2 wgmma in-flight. Both sX
-                        //   and sR are double-buffered so refilling slot
-                        //   (kt+2) does not corrupt the still in-flight
-                        //   wgmma(kt+1) reads.
+                        // [step3k smem-fit revert] Producer R@X wgmma loop,
+                        //   single-buffer, dim-block-by-1. Uses only
+                        //   packed_nope_staging (aliased sX + staging) and
+                        //   packed_r_tile (sR) -- NO alt tiles.
                         //
-                        //   sX_slot[0] aliases packed_nope_staging (also
-                        //     dual-used later for rC scatter and staging->sK).
-                        //   sX_slot[1] lives in packed_x_alt_tile.
-                        //   sR_slot[0] lives in packed_r_tile.
-                        //   sR_slot[1] lives in packed_r_alt_tile.
-                        Tensor sX_slot_0 = make_tensor(
+                        // Why: packed_x_alt_tile + packed_r_alt_tile (+16 KB)
+                        //   were REMOVED from SharedMemoryPlan to fit under
+                        //   the H20 SM90 opt-in dyn-smem cap of 232448 B
+                        //   (MODEL1 plan was 241664 B -> cudaFuncSetAttribute
+                        //   invalid argument, kernel never launched). The
+                        //   stale Jun-30 binary masked this.
+                        //
+                        // Route H step3b (producer-null probe) PROVED the
+                        //   producer is NOT the decode bottleneck (zeroing
+                        //   the ENTIRE nope rebuild gave 0 tps change at
+                        //   19.53/19.54 tps). So the speculative sX-double-
+                        //   buffer + dim-block-by-2 pipeline those alt tiles
+                        //   enabled (Route G step8 + Route H step1) is dead
+                        //   weight -- it only traded smem for cycles the
+                        //   consumer WG was already waiting on.
+                        //
+                        // Byte-correctness: same R@X = X @ R.T math, same
+                        //   tensor shape, same staging->sK copy layout. Only
+                        //   the in-loop schedule changes (1-at-a-time instead
+                        //   of 2-at-a-time, no fill-wgmma overlap).
+                        Tensor sX_tile = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
                             SmemLayoutXTile{}
                         );
-                        Tensor sX_slot_1 = make_tensor(
-                            make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_x_alt_tile)),
-                            SmemLayoutXTile{}
-                        );
-                        Tensor sR_slot_0 = make_tensor(
+                        Tensor sR_tile = make_tensor(
                             make_smem_ptr(plan.packed_r_tile.data()),
                             SmemLayoutKTile{}
                         );
-                        Tensor sR_slot_1 = make_tensor(
-                            make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_r_alt_tile)),
-                            SmemLayoutKTile{}
-                        );
-                        // Plain [64 tokens, 64 dim_out] view over the same 8KB
-                        // as sX_slot_0 (packed_nope_staging), used to scatter
-                        // bf16(rC) and to source 128-bit copies to sK.
                         Tensor sStaging = make_tensor(
                             make_smem_ptr(reinterpret_cast<bf16*>(plan.packed_nope_staging)),
                             Layout<Shape<Int<64>, Int<64>>, Stride<Int<64>, _1>>{}
@@ -734,12 +854,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         TiledMMA tiled_mma_wg = TiledMMA_QK{};
                         ThrMMA thr_mma_wg = tiled_mma_wg.get_slice(idx_in_warpgroup);
 
-                        const int k_tiles = qk_nope / 64;  // 7 for MODEL1
+                        const int k_tiles = qk_nope / 64;
 
-                        // Helper lambdas: fill sX/sR from global for a given k_base.
-                        // Both take a destination tensor so they can target
-                        // either slot.
-                        auto fill_sX_tile = [&](auto &sX_dst, int k_base) {
+                        auto fill_sX_tile = [&](int k_base) {
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int lin = e * 128 + idx_in_warpgroup;
@@ -784,11 +901,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     const float fstep = frange * (1.0f / u_step_denom);
                                     x_val = fmaf((float)code, fstep, fmin);
                                 }
-                                sX_dst(t, d) = bf16(x_val);
+                                sX_tile(t, d) = bf16(x_val);
                             }
                         };
 
-                        auto fill_sR_tile = [&](auto &sR_dst, int dim_base, int k_base) {
+                        auto fill_sR_tile = [&](int dim_base, int k_base) {
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int lin = e * 128 + idx_in_warpgroup;
@@ -799,78 +916,19 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const float r_val = __ldg(
                                     R_base + (int64_t)j_global * (int64_t)qk_nope + (int64_t)d_global
                                 );
-                                sR_dst(j, d) = bf16(r_val);
+                                sR_tile(j, d) = bf16(r_val);
                             }
                         };
 
-                        CUTE_UNROLL
-                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
-                            const int dim_base = dim_block * 64;
-
-                            Tensor rC = partition_fragment_C(
-                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
-                            );
-                            clear(rC);
-
-                            // ---- Prologue: fill sX_slot_0 + sR_slot_0 (kt=0) ----
-                            fill_sX_tile(sX_slot_0, 0);
-                            fill_sR_tile(sR_slot_0, dim_base, 0);
-                            cutlass::arch::fence_view_async_shared();
-                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                            for (int kt = 0; kt < k_tiles; ++kt) {
-                                const bool has_next = (kt + 1) < k_tiles;
-                                const int k_base_next = (kt + 1) * 64;
-
-                                // ---- Async wgmma reads sX_slot[kt&1] + sR_slot[kt&1] ----
-                                if ((kt & 1) == 0) {
-                                    gemm<false, -1>(
-                                        tiled_mma_wg,
-                                        thr_mma_wg.partition_fragment_A(sX_slot_0),
-                                        thr_mma_wg.partition_fragment_B(sR_slot_0),
-                                        rC
-                                    );
-                                } else {
-                                    gemm<false, -1>(
-                                        tiled_mma_wg,
-                                        thr_mma_wg.partition_fragment_A(sX_slot_1),
-                                        thr_mma_wg.partition_fragment_B(sR_slot_1),
-                                        rC
-                                    );
-                                }
-
-                                // ---- Overlap: fill next K-tile into the other
-                                //      slot while current wgmma is running ----
-                                if (has_next) {
-                                    if ((kt & 1) == 0) {
-                                        fill_sX_tile(sX_slot_1, k_base_next);
-                                        fill_sR_tile(sR_slot_1, dim_base, k_base_next);
-                                    } else {
-                                        fill_sX_tile(sX_slot_0, k_base_next);
-                                        fill_sR_tile(sR_slot_0, dim_base, k_base_next);
-                                    }
-                                    cutlass::arch::fence_view_async_shared();
-                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-                                }
-
-                                // ---- Wait for current wgmma to complete ----
-                                cute::warpgroup_wait<0>();
-                            }
-
-                            // ---- Scatter bf16(rC) into sStaging (aliased sX_tile) ----
-                            // partition_C on the plain [64,64] staging tensor gives us
-                            // the exact per-thread MMA_C layout without any STSM helper.
+                        auto scatter_rC_to_sK = [&](auto &rC_frag, int dim_base) {
                             Tensor tC_sStaging = thr_mma_wg.partition_C(sStaging);
                             CUTE_UNROLL
-                            for (int i = 0; i < size(rC); ++i) {
-                                tC_sStaging(i) = bf16(rC(i));
+                            for (int i = 0; i < size(rC_frag); ++i) {
+                                tC_sStaging(i) = bf16(rC_frag(i));
                             }
                             cutlass::arch::fence_view_async_shared();
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
-                            // ---- Reuse legacy staging -> sK 128-bit copy ----
-                            // Byte-identical to the tail of the legacy path so the
-                            // consumer WG sees the same sK layout.
                             CUTE_UNROLL
                             for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
                                 int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
@@ -893,8 +951,36 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 *(__int128_t*)(sK_nope_base + smem_offset_hi) = *(__int128_t*)&val_hi;
                             }
 
-                            // Guard staging reuse in the next dim_block iteration.
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                        };
+
+                        CUTE_UNROLL
+                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
+                            const int dim_base = dim_block * 64;
+
+                            Tensor rC = partition_fragment_C(
+                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
+                            );
+                            clear(rC);
+
+                            for (int kt = 0; kt < k_tiles; ++kt) {
+                                const int k_base = kt * 64;
+                                fill_sX_tile(k_base);
+                                fill_sR_tile(dim_base, k_base);
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                                gemm<false, -1>(
+                                    tiled_mma_wg,
+                                    thr_mma_wg.partition_fragment_A(sX_tile),
+                                    thr_mma_wg.partition_fragment_B(sR_tile),
+                                    rC
+                                );
+                                cute::warpgroup_wait<0>();
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            }
+
+                            scatter_rC_to_sK(rC, dim_base);
                         }
 
                         cutlass::arch::fence_view_async_shared();
@@ -1161,6 +1247,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     fence_view_async_shared();
                     }  // end if (!wgmma_uniform_supported || bu == 0) legacy path
+#else
+                    // [Route H step3b] producer null-work: nope reconstruction
+                    // skipped entirely; only rope-copy above + handshake below
+                    // survive. Keep the async-proxy fence so consumer wgmma
+                    // reads of sK are ordered after the rope stores.
+                    fence_view_async_shared();
+#endif  // FMLA_PRODUCER_NULL_PROBE (skips all nope reconstruction)
+#ifdef FMLA_CLK_PROFILE
+                    unsigned long long _clk_p3 = clock64();
+                    if (idx_in_warpgroup == 0) {
+                        fmla_clk_add(2, _clk_p3 - _clk_p2);
+                        fmla_clk_add(5, 1ull);  // producer block sample count
+                    }
+#endif
                 } else {
                     // ---- Original dense FP8 K-load path ----
                 CUTE_UNROLL
@@ -1441,6 +1541,43 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         launch_params, (void*)mla_kernel, params, tma_params
     );
     KU_CHECK_KERNEL_LAUNCH();
+
+    // [DEBUG] Force synchronous error check to pinpoint illegal instruction.
+    {
+        cudaError_t _e = cudaStreamSynchronize(params.stream);
+        if (_e != cudaSuccess) {
+            fprintf(stderr, "[DEBUG step3k] mla_kernel sync error: %s at %s:%d\n",
+                cudaGetErrorString(_e), __FILE__, __LINE__);
+            fflush(stderr);
+        }
+    }
+
+#ifdef FMLA_CLK_PROFILE
+    // [Route H step3k] throttled readback of the segment cycle counters.
+    //   Print mean cycles/block/segment every N launches, then zero the
+    //   accumulators. N chosen so decode-loop noise averages out while
+    //   staying human-readable in the server log.
+    {
+        static thread_local unsigned long long _fmla_launch_ctr = 0;
+        constexpr unsigned long long PRINT_EVERY = 500ull;
+        if ((++_fmla_launch_ctr % PRINT_EVERY) == 0) {
+            unsigned long long h[8] = {0};
+            cudaMemcpyFromSymbol(h, g_fmla_clk, sizeof(h));
+            unsigned long long np = h[5] ? h[5] : 1ull;  // producer samples
+            unsigned long long nc = h[6] ? h[6] : 1ull;  // consumer samples
+            double p0 = (double)h[0] / np, p1 = (double)h[1] / np, p2 = (double)h[2] / np;
+            double c3 = (double)h[3] / nc, c4 = (double)h[4] / nc;
+            fprintf(stderr,
+                "[FMLA_CLK step3k] launch#%llu np=%llu nc=%llu | "
+                "PROD bar_avail=%.0f rope=%.0f nope_rebuild=%.0f | "
+                "CONS bar_ready=%.0f QK_softmax=%.0f (cyc/block)\n",
+                _fmla_launch_ctr, np, nc, p0, p1, p2, c3, c4);
+            fflush(stderr);
+            unsigned long long z[8] = {0};
+            cudaMemcpyToSymbol(g_fmla_clk, z, sizeof(z));
+        }
+    }
+#endif
 }
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
