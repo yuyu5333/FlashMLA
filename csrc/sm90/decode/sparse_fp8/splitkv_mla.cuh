@@ -242,9 +242,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
     ku::barrier_cluster_wait_acquire();
 
-    // [DEBUG] early return after barrier_cluster_wait_acquire to bisect illegal instruction
-    return;
-
     struct MainloopArgs {
         int start_block_idx, end_block_idx;
         bool is_no_split;
@@ -275,7 +272,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     };
 
     if (warpgroup_idx == 0) {
-        cutlass::arch::warpgroup_reg_alloc<192>();
+        // [DEBUG] disable reg_alloc to test if setmaxnreg is the illegal instruction
+        // cutlass::arch::warpgroup_reg_alloc<192>();
 
         // [DEBUG] early return before main loop to bisect illegal instruction
         return;
@@ -484,7 +482,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             sync_all_threads_in_cluster();
         }
     } else if (warpgroup_idx == 1) {
-        cutlass::arch::warpgroup_reg_dealloc<192>();
+        // [DEBUG] disable reg_dealloc to test if setmaxnreg is the illegal instruction
+        // cutlass::arch::warpgroup_reg_dealloc<192>();
 
         // [DEBUG] early return before main loop to bisect illegal instruction
         return;
