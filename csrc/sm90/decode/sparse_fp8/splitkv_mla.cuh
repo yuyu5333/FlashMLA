@@ -86,7 +86,15 @@
 //   largest single segment at step3o) now the leader? MUST run cgoff (the
 //   readback cudaMemcpyFromSymbol is a stream sync illegal under cgon
 //   capture). Revert after localizing.
-#define FMLA_CLK_PROFILE 1
+// [2026-07-08 step3r done] Reverted to // #define after the R-prestore-bf16
+//   change was measured at cgoff: fill_sR 185K->180.5K cyc (-2.4%),
+//   nope_rebuild 523K->516K (-1.3%). Smaller than hoped: fill_sR is bound by
+//   the 49-tile x 32 strided __ldg LATENCY, not L2 bandwidth or the bf16
+//   convert, so halving the load width barely moves it. Kept because it is
+//   net-positive + value-identical (bf16 RNE == the kernel's prior
+//   bf16(fp32) truncation) and halves R's L2/mem footprint. Next lever is
+//   fill_sX (256K, still #1). Production build carries no counters.
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
