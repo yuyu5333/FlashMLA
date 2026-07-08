@@ -860,24 +860,28 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                         // [step3q] Hoist the per-(token,group) affine header
-                        //   (fmin, fstep) out of fill_sX_tile into a shared
-                        //   table filled ONCE per producer block.
+                        //   OUT of fill_sX_tile into a shared table filled ONCE
+                        //   per producer block.
                         //   In fill_sX_tile the group index
                         //   g = d_global / u_group_size = (k_base + fx_d) / 64
                         //     = k_base >> 6  (fx_d in [0,63] -> no carry),
-                        //   so ALL 64 fx_d threads of a given fx_th read the
-                        //   SAME (token, group) header and each recomputed the
-                        //   two __half2float loads + the frange/denom division
-                        //   for its 32 tokens on every fill_sX_tile call
-                        //   (14 calls/block) = 64x-redundant across fx_d.
-                        //   Precompute all (k_tiles == HEAD_DIM_NOPE/64) groups
-                        //   x 64 tokens once with the full 128-thread WG, then
-                        //   fill_sX_tile just loads s_hdr[g*64 + t] (one float2
-                        //   smem read: x = fmin, y = fstep). Invalid tokens
-                        //   (s_pk_row[t] == nullptr) store {0,0}; the loop still
-                        //   gates on s_pk_row[t] so x_val stays 0 -> byte-
-                        //   identical math vs step3p.
-                        __shared__ float2 s_hdr[(HEAD_DIM_NOPE / 64) * TOPK_BLOCK_SIZE];
+                        //   so ALL 64 fx_d threads of a given fx_th recompute the
+                        //   SAME 64 tokens' (fmin, fstep) -- two __half2float
+                        //   widens PLUS the frange/denom DIVISION -- 64x-
+                        //   redundantly across fx_d, on every fill_sX_tile call.
+                        //   Precompute all (HEAD_DIM_NOPE/64) groups x 64 tokens
+                        //   ONCE with the full 128-thread WG. Store fmin and the
+                        //   PRE-DIVIDED fstep = frange/denom as a __half2 (4 B/
+                        //   entry, 1792 B) so the hot loop drops the division
+                        //   entirely (just two __half2float widens + fmaf). A
+                        //   fp32 float2 table (3584 B) overflows the H20 SM90
+                        //   static-smem headroom (233984 > 232448 cap); the
+                        //   half fstep has 10-bit mantissa vs the bf16(x_val)
+                        //   output's 7-bit, so the extra rounding is below output
+                        //   granularity -> bf16-output-identical to step3p.
+                        //   Invalid tokens (s_pk_row[t]==nullptr) store {0,0};
+                        //   the loop still gates on s_pk_row[t].
+                        __shared__ __half2 s_hdr[(HEAD_DIM_NOPE / 64) * TOPK_BLOCK_SIZE];
                         {
                             const int n_groups = k_tiles;   // == HEAD_DIM_NOPE/64
                             const float inv_denom = 1.0f / u_step_denom;
@@ -887,17 +891,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const int t = idx & (TOPK_BLOCK_SIZE - 1);
                                 const int g = idx / TOPK_BLOCK_SIZE;
                                 const uint8_t* pk_row = s_pk_row[t];
-                                float fmin = 0.0f, fstep = 0.0f;
+                                __half2 hdr = __half2(__float2half(0.0f), __float2half(0.0f));
                                 if (pk_row != nullptr) {
                                     const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
                                     const __half* hdr_h = reinterpret_cast<const __half*>(
                                         pk_row + hdr_delta
                                     );
-                                    fmin = __half2float(hdr_h[0]);
+                                    const float fmin = __half2float(hdr_h[0]);
                                     const float frange = __half2float(hdr_h[1]);
-                                    fstep = frange * inv_denom;
+                                    const float fstep = frange * inv_denom;
+                                    hdr = __half2(__float2half(fmin), __float2half(fstep));
                                 }
-                                s_hdr[idx] = make_float2(fmin, fstep);
+                                s_hdr[idx] = hdr;
                             }
                         }
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
@@ -935,9 +940,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     }
                                     const int code = (int)((word >> shift) & mask);
 
-                                    // [step3q] header (fmin, fstep) hoisted to s_hdr.
-                                    const float2 hdr = s_hdr[hdr_base + t];
-                                    x_val = fmaf((float)code, hdr.y, hdr.x);
+                                    // [step3q] (fmin, fstep) pre-divided + cached
+                                    //   in s_hdr; hot loop just widens + fmaf,
+                                    //   no per-element frange/denom division.
+                                    const __half2 hdr = s_hdr[hdr_base + t];
+                                    const float fmin = __half2float(__low2half(hdr));
+                                    const float fstep = __half2float(__high2half(hdr));
+                                    x_val = fmaf((float)code, fstep, fmin);
                                 }
                                 sX_tile(t, d) = bf16(x_val);
                             }
