@@ -939,7 +939,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   threads), so the changed barrier count is self-
                         //   consistent and does not touch the consumer WG.
                         constexpr int DIM_BLOCKS = HEAD_DIM_NOPE / 64;   // 7
-                        constexpr int RC_GROUP = 3;
+                        // [step3n] RC_GROUP raised 3 -> 4: fill_sX redundancy
+                        //   3x (21 fills) -> 2x (ceil(7/4)=2 groups x 7 kt = 14
+                        //   fills). 4 rC accumulators = 4*32 = 128 regs/thread,
+                        //   still under the producer warpgroup_reg_dealloc<152>
+                        //   budget (5 would be 160 -> overflow). If the extra
+                        //   accumulator spills, the end-to-end cgon tps will
+                        //   regress vs step3m (259 tps) and we revert to 3.
+                        constexpr int RC_GROUP = 4;
 
                         auto do_one_dim = [&](auto &rC_ref, int dim_base, int k_base) {
                             fill_sR_tile(dim_base, k_base);
@@ -971,7 +978,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             Tensor rC0 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
                             Tensor rC1 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
                             Tensor rC2 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
-                            clear(rC0); clear(rC1); clear(rC2);
+                            Tensor rC3 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
+                            clear(rC0); clear(rC1); clear(rC2); clear(rC3);
 
                             for (int kt = 0; kt < k_tiles; ++kt) {
                                 const int k_base = kt * 64;
@@ -991,6 +999,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 do_one_dim(rC0, (grp0 + 0) * 64, k_base);
                                 if (G > 1) do_one_dim(rC1, (grp0 + 1) * 64, k_base);
                                 if (G > 2) do_one_dim(rC2, (grp0 + 2) * 64, k_base);
+                                if (G > 3) do_one_dim(rC3, (grp0 + 3) * 64, k_base);
                             }
 
 #ifdef FMLA_CLK_PROFILE
@@ -999,6 +1008,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             scatter_rC_to_sK(rC0, (grp0 + 0) * 64);
                             if (G > 1) scatter_rC_to_sK(rC1, (grp0 + 1) * 64);
                             if (G > 2) scatter_rC_to_sK(rC2, (grp0 + 2) * 64);
+                            if (G > 3) scatter_rC_to_sK(rC3, (grp0 + 3) * 64);
 #ifdef FMLA_CLK_PROFILE
                             unsigned long long _clk_s5 = clock64();
                             if (idx_in_warpgroup == 0) fmla_clk_add(10, _clk_s5 - _clk_s4);
