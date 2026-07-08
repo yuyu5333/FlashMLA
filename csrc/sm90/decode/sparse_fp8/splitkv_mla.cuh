@@ -672,6 +672,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const uint8_t* pk_base = reinterpret_cast<const uint8_t*>(params.packed_kcache_ptr);
                     const float* sk_base = params.scale_kcache_ptr;
                     const float* R_base = params.R_matrix_ptr;
+                    // [step3r] BF16-prestored R for the uniform-bit fill_sR
+                    //   path (set only when bit_uniform>0). Halves the R L2
+                    //   load width + removes per-element fp32->bf16 convert;
+                    //   value-identical (kernel already truncated R to bf16).
+                    const bf16* R_bf16_base = reinterpret_cast<const bf16*>(params.R_matrix_bf16_ptr);
                     const float* zp_base = params.zero_point_ptr;
                     const int* dob_base = params.dim_of_bit_ptr;
                     const int* bpd_base = params.bitpos_in_dim_ptr;
@@ -963,19 +968,26 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         // [step3o] Same hoist + strength-reduction for fill_sR.
                         //   d is a per-thread constant; j advances by 2 per e, so
                         //   the R address advances by a constant 2*qk_nope stride
-                        //   (no int64 multiply per element). Byte-identical R load.
+                        //   (no int64 multiply per element).
+                        // [step3r] R is now prestored bf16: __ldg reads 2 B and
+                        //   stores straight to sR_tile with no fp32->bf16 convert.
+                        //   Value-identical to the old fp32 __ldg + bf16() cast
+                        //   (bf16 store was already the gemm input precision).
                         auto fill_sR_tile = [&](int dim_base, int k_base) {
                             const int d = fx_d;
                             const int d_global = k_base + d;
                             const int r_stride = 2 * qk_nope;
-                            const float* r_ptr = R_base
+                            const bf16* r_ptr = R_bf16_base
                                 + (int64_t)(dim_base + fx_th) * (int64_t)qk_nope
                                 + (int64_t)d_global;
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int j = e * 2 + fx_th;
-                                const float r_val = __ldg(r_ptr);
-                                sR_tile(j, d) = bf16(r_val);
+                                // Raw 16-bit read-only cached load; bf16 is a
+                                //   16-bit POD so the reinterpret is exact.
+                                const uint16_t rbits =
+                                    __ldg(reinterpret_cast<const uint16_t*>(r_ptr));
+                                sR_tile(j, d) = reinterpret_cast<const bf16&>(rbits);
                                 r_ptr += r_stride;
                             }
                         };

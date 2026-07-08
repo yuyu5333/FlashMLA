@@ -134,6 +134,13 @@ struct SparseAttnDecodeParams {
     void*  __restrict__ packed_kcache_ptr     = nullptr;
     float* __restrict__ scale_kcache_ptr      = nullptr;
     float* __restrict__ R_matrix_ptr          = nullptr;
+    // [step3r] BF16-prestored R for the uniform-bit (bit_uniform>0) wgmma
+    //   fill_sR path. The kernel already truncates R to bf16 before the
+    //   gemm, so prestoring bf16 is value-identical (RNE) while halving the
+    //   L2 load width and removing the per-element fp32->bf16 conversion.
+    //   Set only when R_matrix is passed as bf16 (bit_uniform>0); the legacy
+    //   variable-bit float4 R@x path (bit_uniform==0) keeps R_matrix_ptr.
+    void*  __restrict__ R_matrix_bf16_ptr     = nullptr;
     float* __restrict__ zero_point_ptr        = nullptr;
     int*   __restrict__ dim_of_bit_ptr        = nullptr;
     int*   __restrict__ bitpos_in_dim_ptr     = nullptr;

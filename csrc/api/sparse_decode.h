@@ -208,8 +208,11 @@ inline void sparse_validate_packed_buffers(
         "packed_kcache must be uint8");
     TORCH_CHECK(scale_kcache.dtype() == at::kFloat,
         "scale_kcache must be float32");
-    TORCH_CHECK(R_matrix.dtype() == at::kFloat,
-        "R_matrix must be float32");
+    // [step3r] R_matrix may be float32 (legacy variable-bit path) or
+    //   bfloat16 (uniform-bit fill_sR prestore). Both are value-compatible
+    //   because the uniform kernel truncates R to bf16 before the gemm.
+    TORCH_CHECK(R_matrix.dtype() == at::kFloat || R_matrix.dtype() == at::kBFloat16,
+        "R_matrix must be float32 or bfloat16");
     TORCH_CHECK(zero_point.dtype() == at::kFloat,
         "zero_point must be float32");
 
@@ -674,8 +677,15 @@ sparse_attn_decode_interface(
             params.packed_kcache_ptr = pk.data_ptr();
             params.scale_kcache_ptr =
                 reinterpret_cast<float *>(sk.data_ptr());
-            params.R_matrix_ptr =
-                reinterpret_cast<float *>(Rm.data_ptr());
+            // [step3r] Route R by dtype: bf16 -> uniform fill_sR prestore
+            //   slot; fp32 -> legacy variable-bit float4 R@x slot. Exactly
+            //   one is non-null; the kernel picks by bit_uniform>0.
+            if (Rm.dtype() == at::kBFloat16) {
+                params.R_matrix_bf16_ptr = Rm.data_ptr();
+            } else {
+                params.R_matrix_ptr =
+                    reinterpret_cast<float *>(Rm.data_ptr());
+            }
             params.zero_point_ptr =
                 reinterpret_cast<float *>(zp.data_ptr());
             params.dim_of_bit_ptr =
