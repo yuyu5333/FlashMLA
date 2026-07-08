@@ -96,12 +96,18 @@ namespace sm90::decode::sparse_fp8 {
 //     4: consumer QK + softmax       (wgmma QK + scale_softmax + save)
 //   [5]: number of accumulated (block) samples (only slot used for both WGs;
 //        producer counts into 5, consumer into 6, so we can normalize each).
-//   Slot 7 unused / padding.
+//   [step3l] nope_rebuild sub-segment split (accumulated over all 49
+//     inner iterations per producer block, normalized by np):
+//     7: fill_sX_tile  (bit-unpack + per-group affine + bf16 store)
+//     8: fill_sR_tile  (R matrix __ldg + bf16 store)
+//     9: wgmma chunk   (2x NamedBarrier(128) + gemm + warpgroup_wait<0>)
+//    10: scatter_rC_to_sK (fence + 2x NamedBarrier + staging->sK stores)
+//   Slots 11-15 unused / padding.
 //   NOTE: static (not inline) __device__ -> each instantiation TU gets its
 //   own copy. Safe because the kernel and its host run() readback live in the
 //   same TU per (MODEL_TYPE, NUM_HEADS) instantiation. inline __device__ is
 //   rejected under whole-program mode (-rdc=false).
-static __device__ unsigned long long g_fmla_clk[8];
+static __device__ unsigned long long g_fmla_clk[16];
 
 static __forceinline__ __device__ void fmla_clk_add(int seg, unsigned long long dt) {
     // Only one representative lane per warpgroup logs, to avoid 128x inflation.
@@ -911,8 +917,19 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                             for (int kt = 0; kt < k_tiles; ++kt) {
                                 const int k_base = kt * 64;
+#ifdef FMLA_CLK_PROFILE
+                                unsigned long long _clk_s0 = clock64();
+#endif
                                 fill_sX_tile(k_base);
+#ifdef FMLA_CLK_PROFILE
+                                unsigned long long _clk_s1 = clock64();
+                                if (idx_in_warpgroup == 0) fmla_clk_add(7, _clk_s1 - _clk_s0);
+#endif
                                 fill_sR_tile(dim_base, k_base);
+#ifdef FMLA_CLK_PROFILE
+                                unsigned long long _clk_s2 = clock64();
+                                if (idx_in_warpgroup == 0) fmla_clk_add(8, _clk_s2 - _clk_s1);
+#endif
                                 cutlass::arch::fence_view_async_shared();
                                 NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
@@ -924,9 +941,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 );
                                 cute::warpgroup_wait<0>();
                                 NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+#ifdef FMLA_CLK_PROFILE
+                                unsigned long long _clk_s3 = clock64();
+                                if (idx_in_warpgroup == 0) fmla_clk_add(9, _clk_s3 - _clk_s2);
+#endif
                             }
 
+#ifdef FMLA_CLK_PROFILE
+                            unsigned long long _clk_s4 = clock64();
+#endif
                             scatter_rC_to_sK(rC, dim_base);
+#ifdef FMLA_CLK_PROFILE
+                            unsigned long long _clk_s5 = clock64();
+                            if (idx_in_warpgroup == 0) fmla_clk_add(10, _clk_s5 - _clk_s4);
+#endif
                         }
 
                         cutlass::arch::fence_view_async_shared();
@@ -1497,19 +1525,24 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         static thread_local unsigned long long _fmla_launch_ctr = 0;
         constexpr unsigned long long PRINT_EVERY = 500ull;
         if ((++_fmla_launch_ctr % PRINT_EVERY) == 0) {
-            unsigned long long h[8] = {0};
+            unsigned long long h[16] = {0};
             cudaMemcpyFromSymbol(h, g_fmla_clk, sizeof(h));
             unsigned long long np = h[5] ? h[5] : 1ull;  // producer samples
             unsigned long long nc = h[6] ? h[6] : 1ull;  // consumer samples
             double p0 = (double)h[0] / np, p1 = (double)h[1] / np, p2 = (double)h[2] / np;
             double c3 = (double)h[3] / nc, c4 = (double)h[4] / nc;
+            double s7 = (double)h[7] / np, s8 = (double)h[8] / np;
+            double s9 = (double)h[9] / np, s10 = (double)h[10] / np;
             fprintf(stderr,
                 "[FMLA_CLK step3k] launch#%llu np=%llu nc=%llu | "
                 "PROD bar_avail=%.0f rope=%.0f nope_rebuild=%.0f | "
-                "CONS bar_ready=%.0f QK_softmax=%.0f (cyc/block)\n",
-                _fmla_launch_ctr, np, nc, p0, p1, p2, c3, c4);
+                "CONS bar_ready=%.0f QK_softmax=%.0f (cyc/block)\n"
+                "                  [step3l nope sub] fill_sX=%.0f fill_sR=%.0f "
+                "wgmma+bar=%.0f scatter=%.0f (cyc/block, sum over 49 iters)\n",
+                _fmla_launch_ctr, np, nc, p0, p1, p2, c3, c4,
+                s7, s8, s9, s10);
             fflush(stderr);
-            unsigned long long z[8] = {0};
+            unsigned long long z[16] = {0};
             cudaMemcpyToSymbol(g_fmla_clk, z, sizeof(z));
         }
     }
