@@ -73,7 +73,12 @@
 //   the new dominant sub-segment before choosing the next target (fill_sX
 //   should have dropped ~another 33%; is fill_sR __ldg or barrier now the
 //   leader?). MUST run cgoff. Revert after localizing.
-#define FMLA_CLK_PROFILE 1
+// [2026-07-08 step3o done] Reverted to // #define after the loop-invariant
+//   hoist (fill_sX bit/byte offset + group header offset) and R-address
+//   strength-reduction were verified at cgoff: nope_rebuild 875K->683K cyc
+//   (-22%), fill_sR 338K->196K (-42%, no per-element int64 multiply), fill_sX
+//   456K->412K (-10%). Byte-correct. Production build carries no counters.
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
