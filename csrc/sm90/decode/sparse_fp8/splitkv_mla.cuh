@@ -822,6 +822,43 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                         const int k_tiles = qk_nope / 64;
 
+                        // [step3p] Hoist the per-token packed-row base pointer
+                        //   out of fill_sX_tile into a shared table filled ONCE.
+                        //   pk_row = pk_base + block_index*pk_block_stride +
+                        //   rel_idx*packed_row_bytes depends ONLY on the token
+                        //   (indices_base[t] -> uint32 div + mod + 2 muls), NOT
+                        //   on k_base or d. The step3o fill_sX_tile recomputed
+                        //   that addressing (+ __ldg(index)) for all 32 elements
+                        //   on EVERY (group,kt) call = 14x per producer block,
+                        //   and identically across the 64 fx_d threads sharing
+                        //   an fx_th. Precompute the 64-token pointer table with
+                        //   64 threads, sync once, then fill_sX_tile just indexes
+                        //   s_pk_row[t]. Invalid tokens store nullptr (validity
+                        //   folded in). Byte-identical addressing + validity vs
+                        //   step3o; only the redundant recompute is removed.
+                        __shared__ const uint8_t* s_pk_row[TOPK_BLOCK_SIZE];
+                        if (idx_in_warpgroup < TOPK_BLOCK_SIZE) {
+                            const int t = idx_in_warpgroup;
+                            const int token_index = __ldg(indices_base + t);
+                            bool out_of_range = false;
+                            if constexpr (MODEL_TYPE == ModelType::MODEL1) {
+                                if (rel_block_idx * TOPK_BLOCK_SIZE + t >= topk_length) {
+                                    out_of_range = true;
+                                }
+                            }
+                            const bool invalid = (token_index == -1) || out_of_range;
+                            const uint8_t* row = nullptr;
+                            if (!invalid) {
+                                const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
+                                const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
+                                row = pk_base
+                                    + block_index * pk_block_stride
+                                    + rel_idx_in_block * packed_row_bytes;
+                            }
+                            s_pk_row[t] = row;
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
                         // [step3o] Loop-invariant hoist. For a given thread the
                         //   32 elements share the SAME d = lin & 63 (lin =
                         //   e*128+idx, and 128 is a multiple of 64 so the low 6
@@ -829,7 +866,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   derived from it (bit/byte offset, shift, mask, group
                         //   header offset) are per-thread constants and are
                         //   computed ONCE outside the e-loop instead of 32x.
-                        //   Only pk_row (per token) still varies per element.
                         //   Byte-identical: same sX_tile(t,d) mapping, same math.
                         const int fx_d = idx_in_warpgroup & 63;
                         const int fx_th = idx_in_warpgroup >> 6;   // 0 or 1
@@ -845,24 +881,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int t = e * 2 + fx_th;
-
-                                const int token_index = __ldg(indices_base + t);
-                                bool out_of_range = false;
-                                if constexpr (MODEL_TYPE == ModelType::MODEL1) {
-                                    if (rel_block_idx * TOPK_BLOCK_SIZE + t >= topk_length) {
-                                        out_of_range = true;
-                                    }
-                                }
-                                const bool invalid = (token_index == -1) || out_of_range;
+                                const uint8_t* pk_row = s_pk_row[t];
 
                                 float x_val = 0.0f;
-                                if (!invalid) {
-                                    const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
-                                    const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
-                                    const uint8_t* pk_row = pk_base
-                                        + block_index * pk_block_stride
-                                        + rel_idx_in_block * packed_row_bytes;
-
+                                if (pk_row != nullptr) {
                                     uint32_t word = (uint32_t)pk_row[byte_off];
                                     word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
                                     if (bu > 8) {
