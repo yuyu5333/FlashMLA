@@ -906,51 +906,95 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                         };
 
-                        CUTE_UNROLL
-                        for (int dim_block = 0; dim_block < HEAD_DIM_NOPE / 64; ++dim_block) {
-                            const int dim_base = dim_block * 64;
+                        // [step3m] fill_sX redundancy elimination via GROUPED
+                        //   kt-outer / dim-inner reorder.
+                        //
+                        //   step3l localized the bottleneck: fill_sX_tile
+                        //   (bit-unpack + per-group affine of the packed X row)
+                        //   was ~78% of the whole attention call, because the
+                        //   original dim-outer/kt-inner loop re-unpacked each of
+                        //   the 7 unique X k-tiles once per dim_block -> 7x7=49
+                        //   fills for only 7 distinct tiles (7x redundant).
+                        //
+                        //   fill_sX_tile(k_base) depends ONLY on kt (k_base =
+                        //   kt*64), NOT on dim_block. So we hoist it: for each
+                        //   GROUP of RC_GROUP=3 dim_blocks we keep 3 rC
+                        //   accumulators live and, per kt, unpack sX ONCE then
+                        //   feed all 3 dim_blocks (each needs its own sR + gemm).
+                        //   fill count drops 49 -> ceil(7/3)*7 = 21 (3x instead
+                        //   of 7x). 3 rC = 96 regs/thread, fits the producer
+                        //   warpgroup_reg_dealloc<152> budget (7 rC = 224 would
+                        //   not). A full kt-outer (all 7 rC) is register-
+                        //   infeasible; smem-caching 7 X tiles (56 KB) also
+                        //   overflows the ~7 KB dyn-smem headroom.
+                        //
+                        //   Byte-correct: identical R@X = X @ R.T math, identical
+                        //   sR load + gemm + scatter->sK per dim_block. Only the
+                        //   iteration order + how often sX is (re)filled changes.
+                        //   packed_kv_producer_sync is producer-WG-internal (128
+                        //   threads), so the changed barrier count is self-
+                        //   consistent and does not touch the consumer WG.
+                        constexpr int DIM_BLOCKS = HEAD_DIM_NOPE / 64;   // 7
+                        constexpr int RC_GROUP = 3;
 
-                            Tensor rC = partition_fragment_C(
-                                tiled_mma_wg, Shape<Int<64>, Int<64>>{}
+                        auto do_one_dim = [&](auto &rC_ref, int dim_base, int k_base) {
+                            fill_sR_tile(dim_base, k_base);
+#ifdef FMLA_CLK_PROFILE
+                            unsigned long long _clk_r0 = clock64();
+#endif
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
+                            gemm<false, -1>(
+                                tiled_mma_wg,
+                                thr_mma_wg.partition_fragment_A(sX_tile),
+                                thr_mma_wg.partition_fragment_B(sR_tile),
+                                rC_ref
                             );
-                            clear(rC);
+                            cute::warpgroup_wait<0>();
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+#ifdef FMLA_CLK_PROFILE
+                            unsigned long long _clk_r1 = clock64();
+                            if (idx_in_warpgroup == 0) fmla_clk_add(9, _clk_r1 - _clk_r0);
+#endif
+                        };
+
+                        CUTE_NO_UNROLL
+                        for (int grp0 = 0; grp0 < DIM_BLOCKS; grp0 += RC_GROUP) {
+                            const int rem = DIM_BLOCKS - grp0;
+                            const int G = rem < RC_GROUP ? rem : RC_GROUP;
+
+                            Tensor rC0 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
+                            Tensor rC1 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
+                            Tensor rC2 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
+                            clear(rC0); clear(rC1); clear(rC2);
 
                             for (int kt = 0; kt < k_tiles; ++kt) {
                                 const int k_base = kt * 64;
 #ifdef FMLA_CLK_PROFILE
                                 unsigned long long _clk_s0 = clock64();
 #endif
+                                // Unpack the X k-tile ONCE for the whole group.
                                 fill_sX_tile(k_base);
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 #ifdef FMLA_CLK_PROFILE
                                 unsigned long long _clk_s1 = clock64();
                                 if (idx_in_warpgroup == 0) fmla_clk_add(7, _clk_s1 - _clk_s0);
 #endif
-                                fill_sR_tile(dim_base, k_base);
-#ifdef FMLA_CLK_PROFILE
-                                unsigned long long _clk_s2 = clock64();
-                                if (idx_in_warpgroup == 0) fmla_clk_add(8, _clk_s2 - _clk_s1);
-#endif
-                                cutlass::arch::fence_view_async_shared();
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-
-                                gemm<false, -1>(
-                                    tiled_mma_wg,
-                                    thr_mma_wg.partition_fragment_A(sX_tile),
-                                    thr_mma_wg.partition_fragment_B(sR_tile),
-                                    rC
-                                );
-                                cute::warpgroup_wait<0>();
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-#ifdef FMLA_CLK_PROFILE
-                                unsigned long long _clk_s3 = clock64();
-                                if (idx_in_warpgroup == 0) fmla_clk_add(9, _clk_s3 - _clk_s2);
-#endif
+                                // Feed sX to each dim_block in the group; sX
+                                // stays resident, only sR is (re)loaded per dim.
+                                do_one_dim(rC0, (grp0 + 0) * 64, k_base);
+                                if (G > 1) do_one_dim(rC1, (grp0 + 1) * 64, k_base);
+                                if (G > 2) do_one_dim(rC2, (grp0 + 2) * 64, k_base);
                             }
 
 #ifdef FMLA_CLK_PROFILE
                             unsigned long long _clk_s4 = clock64();
 #endif
-                            scatter_rC_to_sK(rC, dim_base);
+                            scatter_rC_to_sK(rC0, (grp0 + 0) * 64);
+                            if (G > 1) scatter_rC_to_sK(rC1, (grp0 + 1) * 64);
+                            if (G > 2) scatter_rC_to_sK(rC2, (grp0 + 2) * 64);
 #ifdef FMLA_CLK_PROFILE
                             unsigned long long _clk_s5 = clock64();
                             if (idx_in_warpgroup == 0) fmla_clk_add(10, _clk_s5 - _clk_s4);
