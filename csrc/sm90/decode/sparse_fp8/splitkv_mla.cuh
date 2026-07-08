@@ -68,7 +68,12 @@
 //   fill_sX redundancy fix was verified at cgoff (fill_sX 1501K->690K cyc,
 //   nope_rebuild 1880K->1465K, byte-correct). Production build carries no
 //   clock64/atomicAdd counters.
-// #define FMLA_CLK_PROFILE 1
+// [2026-07-08 step3o measure] Temporarily ENABLED again to re-profile the
+//   segment split AFTER step3n (RC_GROUP=4, redundancy 3x->2x). Need to know
+//   the new dominant sub-segment before choosing the next target (fill_sX
+//   should have dropped ~another 33%; is fill_sR __ldg or barrier now the
+//   leader?). MUST run cgoff. Revert after localizing.
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
@@ -949,9 +954,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         constexpr int RC_GROUP = 4;
 
                         auto do_one_dim = [&](auto &rC_ref, int dim_base, int k_base) {
+#ifdef FMLA_CLK_PROFILE
+                            unsigned long long _clk_r00 = clock64();
+#endif
                             fill_sR_tile(dim_base, k_base);
 #ifdef FMLA_CLK_PROFILE
                             unsigned long long _clk_r0 = clock64();
+                            if (idx_in_warpgroup == 0) fmla_clk_add(8, _clk_r0 - _clk_r00);
 #endif
                             cutlass::arch::fence_view_async_shared();
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
