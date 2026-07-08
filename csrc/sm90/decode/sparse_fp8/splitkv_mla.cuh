@@ -78,7 +78,15 @@
 //   strength-reduction were verified at cgoff: nope_rebuild 875K->683K cyc
 //   (-22%), fill_sR 338K->196K (-42%, no per-element int64 multiply), fill_sX
 //   456K->412K (-10%). Byte-correct. Production build carries no counters.
-// #define FMLA_CLK_PROFILE 1
+// [2026-07-08 step3r measure] Temporarily ENABLED again to re-profile the
+//   segment split AFTER step3q (fill_sX per-(token,group) header division
+//   hoisted into s_hdr pre-divided table). Need the new dominant sub-segment
+//   before choosing step3r target: fill_sX should drop further; is fill_sR,
+//   the wgmma+barrier chunk, or the consumer bar_ready empty-wait (355K, the
+//   largest single segment at step3o) now the leader? MUST run cgoff (the
+//   readback cudaMemcpyFromSymbol is a stream sync illegal under cgon
+//   capture). Revert after localizing.
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
