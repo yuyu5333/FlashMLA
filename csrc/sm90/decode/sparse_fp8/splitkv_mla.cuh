@@ -859,6 +859,49 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }
                         NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
+                        // [step3q] Hoist the per-(token,group) affine header
+                        //   (fmin, fstep) out of fill_sX_tile into a shared
+                        //   table filled ONCE per producer block.
+                        //   In fill_sX_tile the group index
+                        //   g = d_global / u_group_size = (k_base + fx_d) / 64
+                        //     = k_base >> 6  (fx_d in [0,63] -> no carry),
+                        //   so ALL 64 fx_d threads of a given fx_th read the
+                        //   SAME (token, group) header and each recomputed the
+                        //   two __half2float loads + the frange/denom division
+                        //   for its 32 tokens on every fill_sX_tile call
+                        //   (14 calls/block) = 64x-redundant across fx_d.
+                        //   Precompute all (k_tiles == HEAD_DIM_NOPE/64) groups
+                        //   x 64 tokens once with the full 128-thread WG, then
+                        //   fill_sX_tile just loads s_hdr[g*64 + t] (one float2
+                        //   smem read: x = fmin, y = fstep). Invalid tokens
+                        //   (s_pk_row[t] == nullptr) store {0,0}; the loop still
+                        //   gates on s_pk_row[t] so x_val stays 0 -> byte-
+                        //   identical math vs step3p.
+                        __shared__ float2 s_hdr[(HEAD_DIM_NOPE / 64) * TOPK_BLOCK_SIZE];
+                        {
+                            const int n_groups = k_tiles;   // == HEAD_DIM_NOPE/64
+                            const float inv_denom = 1.0f / u_step_denom;
+                            for (int idx = idx_in_warpgroup;
+                                 idx < n_groups * TOPK_BLOCK_SIZE;
+                                 idx += 128) {
+                                const int t = idx & (TOPK_BLOCK_SIZE - 1);
+                                const int g = idx / TOPK_BLOCK_SIZE;
+                                const uint8_t* pk_row = s_pk_row[t];
+                                float fmin = 0.0f, fstep = 0.0f;
+                                if (pk_row != nullptr) {
+                                    const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
+                                    const __half* hdr_h = reinterpret_cast<const __half*>(
+                                        pk_row + hdr_delta
+                                    );
+                                    fmin = __half2float(hdr_h[0]);
+                                    const float frange = __half2float(hdr_h[1]);
+                                    fstep = frange * inv_denom;
+                                }
+                                s_hdr[idx] = make_float2(fmin, fstep);
+                            }
+                        }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+
                         // [step3o] Loop-invariant hoist. For a given thread the
                         //   32 elements share the SAME d = lin & 63 (lin =
                         //   e*128+idx, and 128 is a multiple of 64 so the low 6
@@ -877,7 +920,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const int shift = bit_off_global & 7;
                             const uint32_t mask = (1u << bu) - 1u;
                             const int g = d_global / u_group_size;
-                            const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
+                            const int hdr_base = g * TOPK_BLOCK_SIZE;   // [step3q] s_hdr row for this group
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int t = e * 2 + fx_th;
@@ -892,13 +935,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     }
                                     const int code = (int)((word >> shift) & mask);
 
-                                    const __half* hdr_h = reinterpret_cast<const __half*>(
-                                        pk_row + hdr_delta
-                                    );
-                                    const float fmin = __half2float(hdr_h[0]);
-                                    const float frange = __half2float(hdr_h[1]);
-                                    const float fstep = frange * (1.0f / u_step_denom);
-                                    x_val = fmaf((float)code, fstep, fmin);
+                                    // [step3q] header (fmin, fstep) hoisted to s_hdr.
+                                    const float2 hdr = s_hdr[hdr_base + t];
+                                    x_val = fmaf((float)code, hdr.y, hdr.x);
                                 }
                                 sX_tile(t, d) = bf16(x_val);
                             }
