@@ -59,7 +59,12 @@
 //   rebuild vs consumer bar-wait / QK+softmax so we know which segment to
 //   optimize next. Comment out for the byte-correct production build (adds no
 //   counters).
-// #define FMLA_CLK_PROFILE 1
+// [2026-07-08] Temporarily ENABLED to re-measure segment cycles on the
+//   CORRECT fa68162 consumer (the prior Route H "producer exonerated"
+//   conclusion was measured at the corrupted d557790 19.5 tps floor, which
+//   is void). MUST run cgoff (the readback cudaMemcpyFromSymbol is a stream
+//   sync illegal under cgon capture). Revert after localizing the segment.
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
