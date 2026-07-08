@@ -817,13 +817,29 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                         const int k_tiles = qk_nope / 64;
 
+                        // [step3o] Loop-invariant hoist. For a given thread the
+                        //   32 elements share the SAME d = lin & 63 (lin =
+                        //   e*128+idx, and 128 is a multiple of 64 so the low 6
+                        //   bits are idx's). Hence d_global and every quantity
+                        //   derived from it (bit/byte offset, shift, mask, group
+                        //   header offset) are per-thread constants and are
+                        //   computed ONCE outside the e-loop instead of 32x.
+                        //   Only pk_row (per token) still varies per element.
+                        //   Byte-identical: same sX_tile(t,d) mapping, same math.
+                        const int fx_d = idx_in_warpgroup & 63;
+                        const int fx_th = idx_in_warpgroup >> 6;   // 0 or 1
                         auto fill_sX_tile = [&](int k_base) {
+                            const int d = fx_d;
+                            const int d_global = k_base + d;
+                            const int bit_off_global = d_global * bu;
+                            const int byte_off = bit_off_global >> 3;
+                            const int shift = bit_off_global & 7;
+                            const uint32_t mask = (1u << bu) - 1u;
+                            const int g = d_global / u_group_size;
+                            const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
-                                const int lin = e * 128 + idx_in_warpgroup;
-                                const int t = lin >> 6;
-                                const int d = lin & 63;
-                                const int d_global = k_base + d;
+                                const int t = e * 2 + fx_th;
 
                                 const int token_index = __ldg(indices_base + t);
                                 bool out_of_range = false;
@@ -842,20 +858,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         + block_index * pk_block_stride
                                         + rel_idx_in_block * packed_row_bytes;
 
-                                    const int bit_off_global = d_global * bu;
-                                    const int byte_off = bit_off_global >> 3;
-                                    const int shift = bit_off_global & 7;
                                     uint32_t word = (uint32_t)pk_row[byte_off];
                                     word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
                                     if (bu > 8) {
                                         word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                     }
-                                    const uint32_t mask = (1u << bu) - 1u;
                                     const int code = (int)((word >> shift) & mask);
 
-                                    const int g = d_global / u_group_size;
                                     const __half* hdr_h = reinterpret_cast<const __half*>(
-                                        pk_row + nope_bytes - u_hdr_bytes + g * 4
+                                        pk_row + hdr_delta
                                     );
                                     const float fmin = __half2float(hdr_h[0]);
                                     const float frange = __half2float(hdr_h[1]);
@@ -866,18 +877,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         };
 
+                        // [step3o] Same hoist + strength-reduction for fill_sR.
+                        //   d is a per-thread constant; j advances by 2 per e, so
+                        //   the R address advances by a constant 2*qk_nope stride
+                        //   (no int64 multiply per element). Byte-identical R load.
                         auto fill_sR_tile = [&](int dim_base, int k_base) {
+                            const int d = fx_d;
+                            const int d_global = k_base + d;
+                            const int r_stride = 2 * qk_nope;
+                            const float* r_ptr = R_base
+                                + (int64_t)(dim_base + fx_th) * (int64_t)qk_nope
+                                + (int64_t)d_global;
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
-                                const int lin = e * 128 + idx_in_warpgroup;
-                                const int j = lin >> 6;
-                                const int d = lin & 63;
-                                const int j_global = dim_base + j;
-                                const int d_global = k_base + d;
-                                const float r_val = __ldg(
-                                    R_base + (int64_t)j_global * (int64_t)qk_nope + (int64_t)d_global
-                                );
+                                const int j = e * 2 + fx_th;
+                                const float r_val = __ldg(r_ptr);
                                 sR_tile(j, d) = bf16(r_val);
+                                r_ptr += r_stride;
                             }
                         };
 
