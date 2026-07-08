@@ -64,7 +64,11 @@
 //   conclusion was measured at the corrupted d557790 19.5 tps floor, which
 //   is void). MUST run cgoff (the readback cudaMemcpyFromSymbol is a stream
 //   sync illegal under cgon capture). Revert after localizing the segment.
-#define FMLA_CLK_PROFILE 1
+// [2026-07-08 step3m done] Reverted to // #define after the grouped kt-outer
+//   fill_sX redundancy fix was verified at cgoff (fill_sX 1501K->690K cyc,
+//   nope_rebuild 1880K->1465K, byte-correct). Production build carries no
+//   clock64/atomicAdd counters.
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
