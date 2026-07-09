@@ -108,7 +108,15 @@
 //   The prior fused loop's null-check + store dependency serialized the 32
 //   independent scattered loads; splitting exposes memory-level parallelism.
 //   KEPT (net-positive, byte-correct). Production build disables the counters.
-// #define FMLA_CLK_PROFILE 1
+// [2026-07-09 step3v measure] ENABLED to re-profile the FULL segment landscape
+//   AFTER step3u (fill_sX 258K->231K). Need the post-step3u balance between
+//   producer nope_rebuild (~516K, fill_sX now 231K + fill_sR ~180K + wgmma +
+//   scatter) and consumer bar_ready empty-wait (~272K) to decide the next
+//   architectural lever: producer/consumer overlap (deepen the k-buffer
+//   pipeline to hide the consumer bar_ready wait) vs attack fill_sR. MUST run
+//   cgoff (the readback cudaMemcpyFromSymbol is a stream sync illegal under
+//   cgon capture). Revert after localizing.
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
