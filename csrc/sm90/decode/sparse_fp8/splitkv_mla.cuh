@@ -149,7 +149,7 @@
 //   fill_sR + staging), this probe removes fill_sR (35%) + wgmma (10%) +
 //   scatter (2%) = the entire R-related producer cost, on the CORRECT
 //   fa68162 consumer / 165tps baseline. Comment out for production.
-#define FMLA_FOLD_ROT_PROBE2 1
+// #define FMLA_FOLD_ROT_PROBE2 1
 
 #include "splitkv_mla.h"
 
