@@ -132,6 +132,25 @@
 //   step3u (130c8ef) except comments.
 // #define FMLA_CLK_PROFILE 1
 
+// [Route H step4a] fold-rotation EXECUTION-PATH PROBE toggle.
+//   When defined, the packed producer keeps the fill_sX unpack (x = code*step
+//   + min) but SKIPS fill_sR + the R@X wgmma + the rC->staging->sK scatter,
+//   and writes the unpacked x STRAIGHT into sK nope columns instead. This is
+//   the exact producer path that the full fold-rotation design (Q_folded =
+//   Q_nope @ R done once per block in the consumer WG, K = x) would run, so it
+//   measures the decode-tps CEILING achievable by removing R@X from the KV
+//   side. Output is intentionally salad (Q is NOT folded here) -- this is a
+//   PERF probe only, gated by end-to-end decode tps, NOT correctness.
+//     tps jumps  -> R@X removal is the lever; implement the full Q@R fold.
+//     tps flat   -> producer is a pure fill_sX memory-latency wall; the R@X
+//                   fold buys nothing and the 500-line surgery is skipped.
+//   NOTE: unlike the void step2a probe (measured on the corrupted d557790
+//   19.5tps floor, and which only skipped the wgmma MATH while keeping
+//   fill_sR + staging), this probe removes fill_sR (35%) + wgmma (10%) +
+//   scatter (2%) = the entire R-related producer cost, on the CORRECT
+//   fa68162 consumer / 165tps baseline. Comment out for production.
+#define FMLA_FOLD_ROT_PROBE2 1
+
 #include "splitkv_mla.h"
 
 #include <cstdio>
@@ -1177,6 +1196,40 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         for (int grp0 = 0; grp0 < DIM_BLOCKS; grp0 += RC_GROUP) {
                             const int rem = DIM_BLOCKS - grp0;
                             const int G = rem < RC_GROUP ? rem : RC_GROUP;
+#ifdef FMLA_FOLD_ROT_PROBE2
+                            // [Route H step4a] fold-rotation execution-path
+                            //   probe. K = x (identity) -> no R@X mixing; each
+                            //   nope tile kt maps 1:1 to sK cols [kt*64,+64).
+                            //   Collapse the 7x7 grouped loop to a single
+                            //   diagonal pass: fill_sX(kt) once then write x
+                            //   straight to sK. No fill_sR, no wgmma, no rC.
+                            //   fill_sX drops 14->7 calls/block. This is exactly
+                            //   the producer cost the full Q@R fold would incur.
+                            //   Output salad (Q not folded) -> tps-gated probe.
+                            if (grp0 != 0) break;
+                            for (int kt = 0; kt < k_tiles; ++kt) {
+                                const int k_base = kt * 64;
+                                fill_sX_tile(k_base);
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                                CUTE_UNROLL
+                                for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                                    int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
+                                    const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
+                                    const int dim_in_block = (lane_idx / 8) * 16;
+                                    bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
+                                        plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0);
+                                    bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
+                                        plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8);
+                                    bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                        + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
+                                    *(__int128_t*)(sK_nope_base + (k_base + 0) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_lo;
+                                    *(__int128_t*)(sK_nope_base + (k_base + 8) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_hi;
+                                }
+                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            }
+                            continue;
+#endif
 
                             Tensor rC0 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
                             Tensor rC1 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
