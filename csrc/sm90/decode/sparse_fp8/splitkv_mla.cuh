@@ -94,7 +94,12 @@
 //   net-positive + value-identical (bf16 RNE == the kernel's prior
 //   bf16(fp32) truncation) and halves R's L2/mem footprint. Next lever is
 //   fill_sX (256K, still #1). Production build carries no counters.
-// #define FMLA_CLK_PROFILE 1
+// [2026-07-09 step3t measure] Temporarily ENABLED to split seg-7 (fill_sX 256K)
+//   into pure-unpack (7) vs fence+producer-barrier empty-wait (11). step3s
+//   proved fill_sX __ldg is null-effect; the working hypothesis is seg-7's 256K
+//   is dominated by the producer NamedBarrier::sync(128) empty-wait, not the
+//   unpack ALU. MUST run cgoff. Revert after localizing.
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
@@ -1116,11 +1121,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 #endif
                                 // Unpack the X k-tile ONCE for the whole group.
                                 fill_sX_tile(k_base);
+#ifdef FMLA_CLK_PROFILE
+                                // [step3t] split seg-7 into pure-unpack (7) vs
+                                // fence+producer-barrier empty-wait (11) to see
+                                // which half of the 256K is the real cost.
+                                unsigned long long _clk_sM = clock64();
+                                if (idx_in_warpgroup == 0) fmla_clk_add(7, _clk_sM - _clk_s0);
+#endif
                                 cutlass::arch::fence_view_async_shared();
                                 NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 #ifdef FMLA_CLK_PROFILE
                                 unsigned long long _clk_s1 = clock64();
-                                if (idx_in_warpgroup == 0) fmla_clk_add(7, _clk_s1 - _clk_s0);
+                                if (idx_in_warpgroup == 0) fmla_clk_add(11, _clk_s1 - _clk_sM);
 #endif
                                 // Feed sX to each dim_block in the group; sX
                                 // stays resident, only sR is (re)loaded per dim.
@@ -1719,14 +1731,16 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
             double c3 = (double)h[3] / nc, c4 = (double)h[4] / nc;
             double s7 = (double)h[7] / np, s8 = (double)h[8] / np;
             double s9 = (double)h[9] / np, s10 = (double)h[10] / np;
+            double s11 = (double)h[11] / np;
             fprintf(stderr,
                 "[FMLA_CLK step3k] launch#%llu np=%llu nc=%llu | "
                 "PROD bar_avail=%.0f rope=%.0f nope_rebuild=%.0f | "
                 "CONS bar_ready=%.0f QK_softmax=%.0f (cyc/block)\n"
                 "                  [step3l nope sub] fill_sX=%.0f fill_sR=%.0f "
-                "wgmma+bar=%.0f scatter=%.0f (cyc/block, sum over 49 iters)\n",
+                "wgmma+bar=%.0f scatter=%.0f (cyc/block, sum over 49 iters)\n"
+                "                  [step3t sX split] pure_unpack=%.0f sX_barrier_wait=%.0f (cyc/block)\n",
                 _fmla_launch_ctr, np, nc, p0, p1, p2, c3, c4,
-                s7, s8, s9, s10);
+                s7, s8, s9, s10, s7, s11);
             fflush(stderr);
             unsigned long long z[16] = {0};
             cudaMemcpyToSymbol(g_fmla_clk, z, sizeof(z));
