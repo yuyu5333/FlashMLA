@@ -94,7 +94,12 @@
 //   net-positive + value-identical (bf16 RNE == the kernel's prior
 //   bf16(fp32) truncation) and halves R's L2/mem footprint. Next lever is
 //   fill_sX (256K, still #1). Production build carries no counters.
-// #define FMLA_CLK_PROFILE 1
+// [2026-07-08 step3s measure] Temporarily ENABLED again to re-profile the
+//   fill_sX segment AFTER routing its packed-byte reads through the read-only
+//   cache (__ldg). fill_sX was 256K/257K (#1) at step3r; broadcast-friendly
+//   loads should shrink it more than fill_sR's -2.4% did. MUST run cgoff.
+//   Revert after localizing.
+#define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
