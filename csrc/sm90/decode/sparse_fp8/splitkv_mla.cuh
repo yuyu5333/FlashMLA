@@ -952,20 +952,42 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const uint32_t mask = (1u << bu) - 1u;
                             const int g = d_global / u_group_size;
                             const int hdr_base = g * TOPK_BLOCK_SIZE;   // [step3q] s_hdr row for this group
+                            // [step3u] load/compute split. fill_sX is
+                            //   latency-bound scattered per-token global reads
+                            //   (step3t: pure_unpack 258K cyc/block = 98% of
+                            //   seg-7, ~575 cyc/element -> memory-latency wall,
+                            //   __ldg was null-effect at step3s). The prior
+                            //   fused loop chained (2x 1-byte global load ->
+                            //   decode -> bf16 store) per e, so the null-check
+                            //   control dependency + store dependency blocked
+                            //   the compiler from issuing the 32 INDEPENDENT
+                            //   scattered loads back-to-back. Split into a pure
+                            //   load phase (fills a 32-word register array,
+                            //   loads fire in parallel -> max memory-level
+                            //   parallelism hides latency) then a pure decode
+                            //   phase. Value-identical: same word bytes, same
+                            //   fmaf, same bf16 store, only the schedule moves.
+                            uint32_t words[32];
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int t = e * 2 + fx_th;
                                 const uint8_t* pk_row = s_pk_row[t];
-
-                                float x_val = 0.0f;
+                                uint32_t word = 0u;
                                 if (pk_row != nullptr) {
-                                    uint32_t word = (uint32_t)pk_row[byte_off];
+                                    word = (uint32_t)pk_row[byte_off];
                                     word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
                                     if (bu > 8) {
                                         word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                     }
-                                    const int code = (int)((word >> shift) & mask);
-
+                                }
+                                words[e] = word;
+                            }
+                            CUTE_UNROLL
+                            for (int e = 0; e < 32; ++e) {
+                                const int t = e * 2 + fx_th;
+                                float x_val = 0.0f;
+                                if (s_pk_row[t] != nullptr) {
+                                    const int code = (int)((words[e] >> shift) & mask);
                                     // [step3q] (fmin, fstep) pre-divided + cached
                                     //   in s_hdr; hot loop just widens + fmaf,
                                     //   no per-element frange/denom division.
