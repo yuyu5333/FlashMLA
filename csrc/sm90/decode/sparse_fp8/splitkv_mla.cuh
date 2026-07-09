@@ -1025,6 +1025,20 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   stores straight to sR_tile with no fp32->bf16 convert.
                         //   Value-identical to the old fp32 __ldg + bf16() cast
                         //   (bf16 store was already the gemm input precision).
+                        // [step3v] load/compute split, same lever as step3u.
+                        //   step3v measure: after step3u, fill_sR=168K cyc/block
+                        //   is the #2 nope_rebuild sub-segment (35%), a strided
+                        //   __ldg LATENCY wall (step3r). The prior fused loop
+                        //   chained (__ldg -> smem store -> advance) per e, and
+                        //   the intervening shared-memory store acts as a
+                        //   scheduling barrier that stops the compiler from
+                        //   issuing the 32 INDEPENDENT strided loads back-to-back
+                        //   (identical mechanism to step3u fill_sX). Split into a
+                        //   pure load phase (fills a 32-word register array;
+                        //   loads fire in parallel -> memory-level parallelism
+                        //   hides latency) then a pure store phase. Value-
+                        //   identical: same __ldg addresses, same bf16 bits, only
+                        //   the schedule moves.
                         auto fill_sR_tile = [&](int dim_base, int k_base) {
                             const int d = fx_d;
                             const int d_global = k_base + d;
@@ -1032,15 +1046,19 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const bf16* r_ptr = R_bf16_base
                                 + (int64_t)(dim_base + fx_th) * (int64_t)qk_nope
                                 + (int64_t)d_global;
+                            uint16_t rbits_arr[32];
+                            CUTE_UNROLL
+                            for (int e = 0; e < 32; ++e) {
+                                // Raw 16-bit read-only cached load; bf16 is a
+                                //   16-bit POD so the reinterpret is exact.
+                                rbits_arr[e] =
+                                    __ldg(reinterpret_cast<const uint16_t*>(r_ptr));
+                                r_ptr += r_stride;
+                            }
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int j = e * 2 + fx_th;
-                                // Raw 16-bit read-only cached load; bf16 is a
-                                //   16-bit POD so the reinterpret is exact.
-                                const uint16_t rbits =
-                                    __ldg(reinterpret_cast<const uint16_t*>(r_ptr));
-                                sR_tile(j, d) = reinterpret_cast<const bf16&>(rbits);
-                                r_ptr += r_stride;
+                                sR_tile(j, d) = reinterpret_cast<const bf16&>(rbits_arr[e]);
                             }
                         };
 
