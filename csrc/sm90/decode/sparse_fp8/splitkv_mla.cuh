@@ -94,12 +94,21 @@
 //   net-positive + value-identical (bf16 RNE == the kernel's prior
 //   bf16(fp32) truncation) and halves R's L2/mem footprint. Next lever is
 //   fill_sX (256K, still #1). Production build carries no counters.
-// [2026-07-09 step3t measure] Temporarily ENABLED to split seg-7 (fill_sX 256K)
-//   into pure-unpack (7) vs fence+producer-barrier empty-wait (11). step3s
-//   proved fill_sX __ldg is null-effect; the working hypothesis is seg-7's 256K
-//   is dominated by the producer NamedBarrier::sync(128) empty-wait, not the
-//   unpack ALU. MUST run cgoff. Revert after localizing.
-#define FMLA_CLK_PROFILE 1
+// [2026-07-09 step3t measure] ENABLED to split seg-7 (fill_sX 256K) into
+//   pure-unpack (7) vs fence+producer-barrier empty-wait (11).
+// [2026-07-09 step3t RESULT] pure_unpack=258K sX_barrier_wait=5.5K -> the 256K
+//   is 98% pure unpack, NOT the producer barrier empty-wait (2%). step3s
+//   working hypothesis DISPROVEN. fill_sX is a latency-bound scattered
+//   per-token global read wall (~575 cyc/element), consistent with step3s
+//   __ldg null-effect. Optimization must attack the unpack schedule, not the
+//   barrier.
+// [2026-07-09 step3u RESULT] fill_sX load/compute split (fill a 32-word reg
+//   array in a pure load phase, then a pure decode phase) measured
+//   pure_unpack 258K->231K cyc/block (-10.3%), value-identical (curl no salad).
+//   The prior fused loop's null-check + store dependency serialized the 32
+//   independent scattered loads; splitting exposes memory-level parallelism.
+//   KEPT (net-positive, byte-correct). Production build disables the counters.
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
