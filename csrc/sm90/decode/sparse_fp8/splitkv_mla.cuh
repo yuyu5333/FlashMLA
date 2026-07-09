@@ -116,7 +116,21 @@
 //   pipeline to hide the consumer bar_ready wait) vs attack fill_sR. MUST run
 //   cgoff (the readback cudaMemcpyFromSymbol is a stream sync illegal under
 //   cgon capture). Revert after localizing.
-#define FMLA_CLK_PROFILE 1
+// [2026-07-09 step3v RESULT] Measured post-step3u: nope_rebuild=477K/block is
+//   the producer critical path (fill_sX=231K 48%, fill_sR=168K 35%, wgmma=49K,
+//   scatter=9K); CONS bar_ready=160K is the consumer IDLE-waiting for the
+//   producer, while consumer QK_softmax is only 6.5K. So (1) the producer is
+//   unambiguously the long pole and (2) producer/consumer overlap CANNOT help
+//   -- the consumer has almost no work to overlap with (6.5K vs 160K idle).
+//   Tried fill_sR load/compute split (the step3u lever): NULL effect (fill_sR
+//   stayed ~168K) because fill_sR has no null-check dependency and its R reads
+//   are already coalesced across the warpgroup, so the compiler already
+//   pipelines them. Producer inner-loop micro-opt is EXHAUSTED. The remaining
+//   levers are occupancy (2 blocks/SM is smem-blocked: SmemPlan ~180KB x2 >
+//   228KB cap) and the memory main-line. Counters DISABLED for production; the
+//   fill_sR split was reverted so this production build is code-identical to
+//   step3u (130c8ef) except comments.
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
@@ -1025,20 +1039,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   stores straight to sR_tile with no fp32->bf16 convert.
                         //   Value-identical to the old fp32 __ldg + bf16() cast
                         //   (bf16 store was already the gemm input precision).
-                        // [step3v] load/compute split, same lever as step3u.
-                        //   step3v measure: after step3u, fill_sR=168K cyc/block
-                        //   is the #2 nope_rebuild sub-segment (35%), a strided
-                        //   __ldg LATENCY wall (step3r). The prior fused loop
-                        //   chained (__ldg -> smem store -> advance) per e, and
-                        //   the intervening shared-memory store acts as a
-                        //   scheduling barrier that stops the compiler from
-                        //   issuing the 32 INDEPENDENT strided loads back-to-back
-                        //   (identical mechanism to step3u fill_sX). Split into a
-                        //   pure load phase (fills a 32-word register array;
-                        //   loads fire in parallel -> memory-level parallelism
-                        //   hides latency) then a pure store phase. Value-
-                        //   identical: same __ldg addresses, same bf16 bits, only
-                        //   the schedule moves.
+                        // [step3v] load/compute split (fill a 32-word reg array
+                        //   then store) was MEASURED here as a NULL effect:
+                        //   fill_sR stayed ~168K cyc/block. Unlike fill_sX
+                        //   (step3u), fill_sR has no null-check control
+                        //   dependency and its R-matrix reads are already
+                        //   COALESCED across the warpgroup (64 threads read 64
+                        //   consecutive columns = one cache line), so the
+                        //   compiler already pipelines the loads -> no artificial
+                        //   serialization to remove. Consistent with step3r
+                        //   (halving load width only -2.4%): fill_sR is a
+                        //   fundamental L2-latency wall for the constant R
+                        //   matrix, already at floor. REVERTED to the step3r
+                        //   fused form. Producer inner-loop micro-opt is now
+                        //   exhausted (fill_sX 231K + fill_sR 168K = 84% of
+                        //   nope_rebuild, both at floor); next lever is
+                        //   architectural (producer/consumer overlap / memory
+                        //   main-line).
                         auto fill_sR_tile = [&](int dim_base, int k_base) {
                             const int d = fx_d;
                             const int d_global = k_base + d;
@@ -1046,19 +1063,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const bf16* r_ptr = R_bf16_base
                                 + (int64_t)(dim_base + fx_th) * (int64_t)qk_nope
                                 + (int64_t)d_global;
-                            uint16_t rbits_arr[32];
-                            CUTE_UNROLL
-                            for (int e = 0; e < 32; ++e) {
-                                // Raw 16-bit read-only cached load; bf16 is a
-                                //   16-bit POD so the reinterpret is exact.
-                                rbits_arr[e] =
-                                    __ldg(reinterpret_cast<const uint16_t*>(r_ptr));
-                                r_ptr += r_stride;
-                            }
                             CUTE_UNROLL
                             for (int e = 0; e < 32; ++e) {
                                 const int j = e * 2 + fx_th;
-                                sR_tile(j, d) = reinterpret_cast<const bf16&>(rbits_arr[e]);
+                                // Raw 16-bit read-only cached load; bf16 is a
+                                //   16-bit POD so the reinterpret is exact.
+                                const uint16_t rbits =
+                                    __ldg(reinterpret_cast<const uint16_t*>(r_ptr));
+                                sR_tile(j, d) = reinterpret_cast<const bf16&>(rbits);
+                                r_ptr += r_stride;
                             }
                         };
 
