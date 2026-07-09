@@ -94,12 +94,7 @@
 //   net-positive + value-identical (bf16 RNE == the kernel's prior
 //   bf16(fp32) truncation) and halves R's L2/mem footprint. Next lever is
 //   fill_sX (256K, still #1). Production build carries no counters.
-// [2026-07-08 step3s measure] Temporarily ENABLED again to re-profile the
-//   fill_sX segment AFTER routing its packed-byte reads through the read-only
-//   cache (__ldg). fill_sX was 256K/257K (#1) at step3r; broadcast-friendly
-//   loads should shrink it more than fill_sR's -2.4% did. MUST run cgoff.
-//   Revert after localizing.
-#define FMLA_CLK_PROFILE 1
+// #define FMLA_CLK_PROFILE 1
 
 #include "splitkv_mla.h"
 
@@ -959,23 +954,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                                 float x_val = 0.0f;
                                 if (pk_row != nullptr) {
-                                    // [step3s] Route the packed-byte reads through
-                                    //   the read-only data cache (LDG.CI). Unlike
-                                    //   fill_sR's scattered per-token R loads (each
-                                    //   warp lane hits a DISTINCT token row -> 32
-                                    //   cache lines, latency-bound, __ldg only
-                                    //   -2.4%), fill_sX is BROADCAST-friendly: for
-                                    //   a fixed e the 32 warp lanes read the SAME
-                                    //   pk_row[t] at adjacent byte_off (d=0..31,
-                                    //   bu=3 -> ~12 B span -> one cache line). The
-                                    //   read-only cache keeps this hot row resident
-                                    //   across the 49 (group,kt) fills without L1
-                                    //   store-path pollution. Byte-identical: same
-                                    //   bytes, same shift/mask/affine math.
-                                    uint32_t word = (uint32_t)__ldg(pk_row + byte_off);
-                                    word |= ((uint32_t)__ldg(pk_row + byte_off + 1)) << 8;
+                                    uint32_t word = (uint32_t)pk_row[byte_off];
+                                    word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
                                     if (bu > 8) {
-                                        word |= ((uint32_t)__ldg(pk_row + byte_off + 2)) << 16;
+                                        word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                     }
                                     const int code = (int)((word >> shift) & mask);
 
