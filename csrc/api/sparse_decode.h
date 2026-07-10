@@ -422,17 +422,12 @@ sparse_attn_decode_interface(
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     KU_CHECK_SHAPE(q_for_extra, b, s_q, h_q, d_qk);
-    if (q_nope_is_folded) {
-        TORCH_CHECK(d_qk == 512,
-            "q_nope_is_folded expects MODEL1 d_qk=512, got ", d_qk);
-        if (have_extra_kcache) {
-            TORCH_CHECK(q_for_extra.has_value(),
-                "q_for_extra must be provided when folded Q is used with extra_kv");
-        }
-    } else {
-        TORCH_CHECK(!q_for_extra.has_value(),
-            "q_for_extra requires q_nope_is_folded=True");
-    }
+    TORCH_CHECK(!q_nope_is_folded,
+        "q_nope_is_folded was rejected: Q@R fold changes the BF16 rounding "
+        "path and fails end-to-end correctness. Use identity_tail_bypass for "
+        "the safe K-side identity-tail optimization.");
+    TORCH_CHECK(!q_for_extra.has_value(),
+        "q_for_extra is only meaningful for the rejected q_nope_is_folded path");
     {
         // [M3.c.4 Stage-5 / B-step1] packed-FP8 path may pass a kv tensor
         // whose bytes_per_token is the packed row layout (e.g. 268 for
@@ -665,8 +660,6 @@ sparse_attn_decode_interface(
             "all six of (packed_kcache, scale_kcache, R_matrix, zero_point, "
             "dim_of_bit, bitpos_in_dim) to be None or all six non-None. "
             "Got non-None count=", num_packed_present);
-        TORCH_CHECK(!q_nope_is_folded || num_packed_present == 6,
-            "q_nope_is_folded requires the packed-FP8 sparse path");
         TORCH_CHECK(!identity_tail_bypass || num_packed_present == 6,
             "identity_tail_bypass requires the packed-FP8 sparse path");
 
@@ -730,7 +723,6 @@ sparse_attn_decode_interface(
             // that reads N-bit uniform codes + per-group fp16 affine
             // header. bit_uniform == 0 keeps legacy.
             params.bit_uniform = static_cast<int>(bit_uniform);
-            params.q_nope_is_folded = q_nope_is_folded ? 1 : 0;
             params.identity_tail_bypass = identity_tail_bypass ? 1 : 0;
             TORCH_CHECK(!identity_tail_bypass || params.bit_uniform > 0,
                 "identity_tail_bypass requires bit_uniform>0");
