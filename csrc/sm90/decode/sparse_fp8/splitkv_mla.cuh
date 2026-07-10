@@ -1269,7 +1269,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             Tensor rC3 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
                             clear(rC0); clear(rC1); clear(rC2); clear(rC3);
 
-                            for (int kt = 0; kt < k_tiles; ++kt) {
+                            const int kt_end = (params.identity_tail_bypass && grp0 == 0)
+                                ? 4    // block-diagonal R: H_256 output only needs 256 input dims
+                                : k_tiles;
+                            for (int kt = 0; kt < kt_end; ++kt) {
                                 const int k_base = kt * 64;
 #ifdef FMLA_CLK_PROFILE
                                 unsigned long long _clk_s0 = clock64();
