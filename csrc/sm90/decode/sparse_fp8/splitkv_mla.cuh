@@ -999,6 +999,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const int bit_off_global = d_global * bu;
                             const int byte_off = bit_off_global >> 3;
                             const int shift = bit_off_global & 7;
+#if defined(FMLA_ENABLE_U32_LOAD_ORACLE)
+                            const int word_byte_off = byte_off & ~3;
+                            const int word_shift = shift + ((byte_off & 3) << 3);
+                            const bool use_u32_load = params.debug_u32_packed_load && bu <= 3;
+                            const int decode_shift = use_u32_load ? word_shift : shift;
+#else
+                            const int decode_shift = shift;
+#endif
                             const uint32_t mask = (1u << bu) - 1u;
                             const int g = d_global / u_group_size;
                             const int hdr_base = g * TOPK_BLOCK_SIZE;   // [step3q] s_hdr row for this group
@@ -1024,11 +1032,28 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const uint8_t* pk_row = s_pk_row[t];
                                 uint32_t word = 0u;
                                 if (pk_row != nullptr) {
+#if defined(FMLA_ENABLE_U32_LOAD_ORACLE)
+                                    if (use_u32_load) {
+                                        // Debug/probe-only oracle path for the
+                                        // rejected u32-load experiment. Keep it
+                                        // runtime-gated so the default byte-load
+                                        // production path is unchanged.
+                                        word = __ldg(reinterpret_cast<const uint32_t*>(
+                                            pk_row + word_byte_off));
+                                    } else {
+                                        word = (uint32_t)pk_row[byte_off];
+                                        word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
+                                        if (bu > 8) {
+                                            word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
+                                        }
+                                    }
+#else
                                     word = (uint32_t)pk_row[byte_off];
                                     word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
                                     if (bu > 8) {
                                         word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                     }
+#endif
                                 }
                                 words[e] = word;
                             }
@@ -1037,7 +1062,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const int t = e * 2 + fx_th;
                                 float x_val = 0.0f;
                                 if (s_pk_row[t] != nullptr) {
-                                    const int code = (int)((words[e] >> shift) & mask);
+                                    const int code = (int)((words[e] >> decode_shift) & mask);
                                     // [step3q] (fmin, fstep) pre-divided + cached
                                     //   in s_hdr; hot loop just widens + fmaf,
                                     //   no per-element frange/denom division.

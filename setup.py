@@ -20,6 +20,8 @@ def get_features_args():
     features_args = []
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if is_flag_set("FLASH_MLA_ENABLE_U32_LOAD_ORACLE"):
+        features_args.append("-DFMLA_ENABLE_U32_LOAD_ORACLE")
     return features_args
 
 def get_arch_flags():

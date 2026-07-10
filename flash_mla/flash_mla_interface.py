@@ -86,6 +86,7 @@ def flash_mla_with_kvcache(
     q_for_extra: Optional[torch.Tensor] = None,
     q_nope_is_folded: bool = False,
     identity_tail_bypass: bool = False,
+    debug_u32_packed_load: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -185,6 +186,7 @@ def flash_mla_with_kvcache(
             q_for_extra,
             q_nope_is_folded,
             identity_tail_bypass,
+            debug_u32_packed_load,
         )
     else:
         # Dense attention

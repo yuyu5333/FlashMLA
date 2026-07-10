@@ -70,6 +70,8 @@ COMPARE = int(os.environ.get("PROBE_COMPARE", "0"))
 R_IDENTITY = int(os.environ.get("PROBE_R_IDENTITY", "0"))
 Q_FOLD_FP32 = int(os.environ.get("PROBE_Q_FOLD_FP32", "0"))
 IDENTITY_TAIL_BYPASS = int(os.environ.get("PROBE_IDENTITY_TAIL_BYPASS", "0"))
+DEBUG_U32_LOAD = int(os.environ.get("PROBE_DEBUG_U32_LOAD", "0"))
+COMPARE_U32_LOAD = int(os.environ.get("PROBE_COMPARE_U32_LOAD", "0"))
 
 p = RawTestParam(
     b=B, h_q=H_Q, s_q=1, h_kv=1, s_kv=S_KV, is_varlen=False, topk=TOPK,
@@ -151,7 +153,7 @@ if Q_FOLD and _bu > 0:
     print("[probe] q_nope_is_folded=True (q_nope @ R, producer writes x directly)")
 
 
-def one_call(q_arg=q_call, folded=q_nope_is_folded):
+def one_call(q_arg=q_call, folded=q_nope_is_folded, debug_u32_load=DEBUG_U32_LOAD):
     return flash_mla.flash_mla_with_kvcache(
         q=q_arg,
         k_cache=k_cache,
@@ -166,6 +168,7 @@ def one_call(q_arg=q_call, folded=q_nope_is_folded):
         attn_sink=t.attn_sink,
         q_nope_is_folded=folded,
         identity_tail_bypass=bool(IDENTITY_TAIL_BYPASS),
+        debug_u32_packed_load=bool(debug_u32_load),
         **packed_kwargs,
     )[0]
 
@@ -187,6 +190,17 @@ out = one_call()
 torch.cuda.synchronize()
 print(f"[probe] out.shape={tuple(out.shape)} "
       f"finite={torch.isfinite(out).all().item()}")
+
+if COMPARE_U32_LOAD and _bu > 0:
+    print(
+        "[probe] PROBE_COMPARE_U32_LOAD=1; this is meaningful only when "
+        "FlashMLA was built with FMLA_ENABLE_U32_LOAD_ORACLE."
+    )
+    out_byte = one_call(t.q, False, debug_u32_load=0)
+    torch.cuda.synchronize()
+    out_u32 = one_call(t.q, False, debug_u32_load=1)
+    torch.cuda.synchronize()
+    print_diff("byte_load_vs_u32_load", out_byte, out_u32)
 
 if COMPARE and _bu > 0:
     old_tail_bypass = IDENTITY_TAIL_BYPASS

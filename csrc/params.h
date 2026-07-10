@@ -174,6 +174,7 @@ struct SparseAttnDecodeParams {
     int                 uniform_num_groups    = 0;
     int                 q_nope_is_folded      = 0;
     int                 identity_tail_bypass  = 0;
+    int                 debug_u32_packed_load = 0;
 };
 
 struct CombineParams {
