@@ -1240,10 +1240,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
                                         const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
                                         const int dim_in_block = (lane_idx / 8) * 16;
-                                        bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
-                                            plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0);
-                                        bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
-                                            plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8);
+                                        bf16x8 val_lo;
+                                        bf16x8 val_hi;
+                                        CUTE_UNROLL
+                                        for (int i = 0; i < 8; ++i) {
+                                            reinterpret_cast<bf16*>(&val_lo)[i] =
+                                                sX_tile(abs_token, dim_in_block + i);
+                                            reinterpret_cast<bf16*>(&val_hi)[i] =
+                                                sX_tile(abs_token, dim_in_block + 8 + i);
+                                        }
                                         bf16* sK_nope_base = plan.u.k[buf_idx].data()
                                             + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
                                         *(__int128_t*)(sK_nope_base + (k_base + 0) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_lo;
