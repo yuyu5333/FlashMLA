@@ -1157,16 +1157,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   threads), so the changed barrier count is self-
                         //   consistent and does not touch the consumer WG.
                         constexpr int DIM_BLOCKS = HEAD_DIM_NOPE / 64;   // 7
-                        // [ncu step3w] RC_GROUP=4 was measured to spill heavily:
-                        //   ncu full: ~2.0M register-spill instructions, 168
-                        //   regs/thread, long_scoreboard 22.6 cyc/inst, barrier
-                        //   15.7 cyc/inst, DRAM only 0.15% peak. The fourth rC
-                        //   accumulator increases live state without fixing the
-                        //   real limiter (1 block/SM + scoreboard/barrier stalls).
-                        //   Revert to 3 accumulators to cut register pressure and
-                        //   local-memory spill traffic; keep the grouped sX reuse
-                        //   from step3m (49 fills -> 21 fills).
-                        constexpr int RC_GROUP = 3;
+                        // [step3n] RC_GROUP raised 3 -> 4: fill_sX redundancy
+                        //   3x (21 fills) -> 2x (ceil(7/4)=2 groups x 7 kt = 14
+                        //   fills). 4 rC accumulators = 4*32 = 128 regs/thread,
+                        //   still under the producer warpgroup_reg_dealloc<152>
+                        //   budget (5 would be 160 -> overflow). If the extra
+                        //   accumulator spills, the end-to-end cgon tps will
+                        //   regress vs step3m (259 tps) and we revert to 3.
+                        constexpr int RC_GROUP = 4;
 
                         auto do_one_dim = [&](auto &rC_ref, int dim_base, int k_base) {
 #ifdef FMLA_CLK_PROFILE
