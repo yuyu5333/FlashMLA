@@ -47,6 +47,9 @@ dev = torch.device("cuda:0")
 # cpu helpers don't collide.
 torch.set_default_device(dev)
 torch.cuda.set_device(dev)
+# MODEL1_FP8Sparse layout hardcodes 2-byte (bf16) rope; the generator uses the
+# default dtype, so it must be bf16 (matching the validated test main()).
+torch.set_default_dtype(torch.bfloat16)
 
 # ---- production-like MODEL1 swa decode workload ----
 B = int(os.environ.get("PROBE_B", "32"))
