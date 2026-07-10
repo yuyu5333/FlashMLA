@@ -130,7 +130,7 @@
 //   228KB cap) and the memory main-line. Counters DISABLED for production; the
 //   fill_sR split was reverted so this production build is code-identical to
 //   step3u (130c8ef) except comments.
-// #define FMLA_CLK_PROFILE 1
+#define FMLA_CLK_PROFILE 1
 
 // [Route H step4a] fold-rotation EXECUTION-PATH PROBE toggle.
 //   When defined, the packed producer keeps the fill_sX unpack (x = code*step
@@ -1876,7 +1876,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     //   staying human-readable in the server log.
     {
         static thread_local unsigned long long _fmla_launch_ctr = 0;
-        constexpr unsigned long long PRINT_EVERY = 500ull;
+        constexpr unsigned long long PRINT_EVERY = 10ull;
         if ((++_fmla_launch_ctr % PRINT_EVERY) == 0) {
             unsigned long long h[16] = {0};
             cudaMemcpyFromSymbol(h, g_fmla_clk, sizeof(h));
