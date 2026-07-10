@@ -409,7 +409,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int row = idx / HEAD_DIM_K;
                     const int col = idx - row * HEAD_DIM_K;
                     bf16 val = (row < num_valid_seq_q)
-                        ? __ldg(q_extra_ptr + row * params.stride_extra_q_h_q + col)
+                        ? *(q_extra_ptr + row * params.stride_extra_q_h_q + col)
                         : bf16(0.0f);
                     sQ(row, col) = val;
                 }
