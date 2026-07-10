@@ -69,6 +69,9 @@ struct SparseAttnDecodeParams {
     ModelType model_type;
 
     cutlass::bfloat16_t* __restrict__ q;   // [b, s_q, h_q, d_qk]
+    // Optional original-Q pointer used when q carries folded NoPE for packed
+    // orig blocks but extra native blocks still need unfurled/original Q.
+    cutlass::bfloat16_t* __restrict__ extra_q = nullptr;  // [b, s_q, h_q, d_qk]
     cutlass::bfloat16_t* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]
     int* __restrict__ indices;   // [b, s_q, topk]
     int* __restrict__ topk_length;  // [b], may be nullptr
@@ -83,6 +86,7 @@ struct SparseAttnDecodeParams {
     int* __restrict__ extra_topk_length;  // [b], may be nullptr
     
     int stride_q_b, stride_q_s_q, stride_q_h_q;
+    int stride_extra_q_b = 0, stride_extra_q_s_q = 0, stride_extra_q_h_q = 0;
     int stride_kv_block, stride_kv_row;
     int stride_indices_b, stride_indices_s_q;
     int stride_lse_b, stride_lse_s_q;
@@ -168,6 +172,7 @@ struct SparseAttnDecodeParams {
     int                 uniform_header_bytes  = 0;
     int                 uniform_group_size    = 64;
     int                 uniform_num_groups    = 0;
+    int                 q_nope_is_folded      = 0;
 };
 
 struct CombineParams {

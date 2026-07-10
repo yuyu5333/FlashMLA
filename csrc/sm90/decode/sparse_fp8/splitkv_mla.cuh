@@ -395,12 +395,40 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
             // Wait for Q
             plan.bar_q.wait((sched_meta.begin_req_idx-batch_idx)&1);
+            bool extra_q_loaded = false;
+
+            auto reload_original_q_for_extra = [&]() {
+                if (params.extra_q == nullptr || extra_q_loaded) return;
+                const int start_head_idx = head_block_idx * BLOCK_M;
+                const int num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M);
+                const bf16* q_extra_ptr = params.extra_q
+                    + batch_idx * params.stride_extra_q_b
+                    + s_q_idx * params.stride_extra_q_s_q
+                    + start_head_idx * params.stride_extra_q_h_q;
+                for (int idx = idx_in_warpgroup; idx < BLOCK_M * HEAD_DIM_K; idx += 128) {
+                    const int row = idx / HEAD_DIM_K;
+                    const int col = idx - row * HEAD_DIM_K;
+                    bf16 val = (row < num_valid_seq_q)
+                        ? __ldg(q_extra_ptr + row * params.stride_extra_q_h_q + col)
+                        : bf16(0.0f);
+                    sQ(row, col) = val;
+                }
+                cutlass::arch::fence_view_async_shared();
+                NamedBarrier::sync(128, NamedBarriers::warpgroup0_sync);
+                extra_q_loaded = true;
+            };
 
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
                 Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutHalfV{});
+
+                if constexpr (MODEL_TYPE == ModelType::MODEL1) {
+                    if (block_idx >= args.num_orig_kv_blocks) {
+                        reload_original_q_for_extra();
+                    }
+                }
 
                 // Wait, issue WGMMA
 #ifdef FMLA_CLK_PROFILE
@@ -1196,40 +1224,35 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         for (int grp0 = 0; grp0 < DIM_BLOCKS; grp0 += RC_GROUP) {
                             const int rem = DIM_BLOCKS - grp0;
                             const int G = rem < RC_GROUP ? rem : RC_GROUP;
-#ifdef FMLA_FOLD_ROT_PROBE2
-                            // [Route H step4a] fold-rotation execution-path
-                            //   probe. K = x (identity) -> no R@X mixing; each
-                            //   nope tile kt maps 1:1 to sK cols [kt*64,+64).
-                            //   Collapse the 7x7 grouped loop to a single
-                            //   diagonal pass: fill_sX(kt) once then write x
-                            //   straight to sK. No fill_sR, no wgmma, no rC.
-                            //   fill_sX drops 14->7 calls/block. This is exactly
-                            //   the producer cost the full Q@R fold would incur.
-                            //   Output salad (Q not folded) -> tps-gated probe.
-                            if (grp0 != 0) break;
-                            for (int kt = 0; kt < k_tiles; ++kt) {
-                                const int k_base = kt * 64;
-                                fill_sX_tile(k_base);
-                                cutlass::arch::fence_view_async_shared();
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-                                CUTE_UNROLL
-                                for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
-                                    int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
-                                    const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
-                                    const int dim_in_block = (lane_idx / 8) * 16;
-                                    bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
-                                        plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0);
-                                    bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
-                                        plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8);
-                                    bf16* sK_nope_base = plan.u.k[buf_idx].data()
-                                        + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
-                                    *(__int128_t*)(sK_nope_base + (k_base + 0) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_lo;
-                                    *(__int128_t*)(sK_nope_base + (k_base + 8) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_hi;
+                            if (params.q_nope_is_folded) {
+                                // Full Q@R fold path. Python passes q_nope @ R as
+                                // Q, so the packed value x is already in the K
+                                // basis consumed by QK. Write x directly to sK
+                                // and skip fill_sR + R@X wgmma + rC scatter.
+                                if (grp0 != 0) break;
+                                for (int kt = 0; kt < k_tiles; ++kt) {
+                                    const int k_base = kt * 64;
+                                    fill_sX_tile(k_base);
+                                    cutlass::arch::fence_view_async_shared();
+                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                                    CUTE_UNROLL
+                                    for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                                        int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
+                                        const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
+                                        const int dim_in_block = (lane_idx / 8) * 16;
+                                        bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
+                                            plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0);
+                                        bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
+                                            plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8);
+                                        bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                            + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
+                                        *(__int128_t*)(sK_nope_base + (k_base + 0) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_lo;
+                                        *(__int128_t*)(sK_nope_base + (k_base + 8) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_hi;
+                                    }
+                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                                 }
-                                NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                                continue;
                             }
-                            continue;
-#endif
 
                             Tensor rC0 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});
                             Tensor rC1 = partition_fragment_C(tiled_mma_wg, Shape<Int<64>, Int<64>>{});

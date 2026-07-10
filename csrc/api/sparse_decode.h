@@ -316,7 +316,9 @@ sparse_attn_decode_interface(
     // backward-compat, byte-identical to pre-step-5). bit_uniform > 0
     // -> every nope dim uses bit_uniform contiguous bits; per-token
     // affine (min, range) lives in fp16 header at end of packed row.
-    int64_t bit_uniform                            = 0
+    int64_t bit_uniform                            = 0,
+    const std::optional<at::Tensor> &q_for_extra   = std::nullopt,
+    bool q_nope_is_folded                          = false
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -384,9 +386,11 @@ sparse_attn_decode_interface(
     KU_CHECK_DEVICE(extra_kv);
     KU_CHECK_DEVICE(extra_indices);
     KU_CHECK_DEVICE(extra_topk_length);
+    KU_CHECK_DEVICE(q_for_extra);
 
     // Check data type
     KU_CHECK_DTYPE(q, torch::kBFloat16);
+    KU_CHECK_DTYPE(q_for_extra, torch::kBFloat16);
     TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8, "key must have dtype fp8_e4m3fn, int8 or uint8");
     if (extra_kv.has_value()) {
         TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8");
@@ -401,6 +405,7 @@ sparse_attn_decode_interface(
     
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(q_for_extra);
     KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_CONTIGUOUS(topk_length);
@@ -415,6 +420,18 @@ sparse_attn_decode_interface(
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
+    KU_CHECK_SHAPE(q_for_extra, b, s_q, h_q, d_qk);
+    if (q_nope_is_folded) {
+        TORCH_CHECK(d_qk == 512,
+            "q_nope_is_folded expects MODEL1 d_qk=512, got ", d_qk);
+        if (have_extra_kcache) {
+            TORCH_CHECK(q_for_extra.has_value(),
+                "q_for_extra must be provided when folded Q is used with extra_kv");
+        }
+    } else {
+        TORCH_CHECK(!q_for_extra.has_value(),
+            "q_for_extra requires q_nope_is_folded=True");
+    }
     {
         // [M3.c.4 Stage-5 / B-step1] packed-FP8 path may pass a kv tensor
         // whose bytes_per_token is the packed row layout (e.g. 268 for
@@ -547,6 +564,7 @@ sparse_attn_decode_interface(
         model_type,
 
         (bf16*)q.data_ptr(),
+        ku::get_optional_tensor_ptr<bf16>(q_for_extra),
         (bf16*)kv.data_ptr(),
         (int*)indices.data_ptr(),
         ku::get_optional_tensor_ptr<int>(topk_length),
@@ -560,6 +578,9 @@ sparse_attn_decode_interface(
         ku::get_optional_tensor_ptr<int>(extra_topk_length),
 
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
+        q_for_extra.has_value() ? int64_stride_to_int(q_for_extra->stride(0)) : 0,
+        q_for_extra.has_value() ? int64_stride_to_int(q_for_extra->stride(1)) : 0,
+        q_for_extra.has_value() ? int64_stride_to_int(q_for_extra->stride(2)) : 0,
         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
         int64_stride_to_int(lse.stride(0)), int64_stride_to_int(lse.stride(1)),
@@ -643,6 +664,8 @@ sparse_attn_decode_interface(
             "all six of (packed_kcache, scale_kcache, R_matrix, zero_point, "
             "dim_of_bit, bitpos_in_dim) to be None or all six non-None. "
             "Got non-None count=", num_packed_present);
+        TORCH_CHECK(!q_nope_is_folded || num_packed_present == 6,
+            "q_nope_is_folded requires the packed-FP8 sparse path");
 
         if (num_packed_present == 6) {
             const at::Tensor &pk = packed_kcache.value();
@@ -704,6 +727,7 @@ sparse_attn_decode_interface(
             // that reads N-bit uniform codes + per-group fp16 affine
             // header. bit_uniform == 0 keeps legacy.
             params.bit_uniform = static_cast<int>(bit_uniform);
+            params.q_nope_is_folded = q_nope_is_folded ? 1 : 0;
             if (params.bit_uniform > 0) {
                 params.uniform_group_size = 64;
                 TORCH_CHECK(qk_nope_head_dim_val % 64 == 0,

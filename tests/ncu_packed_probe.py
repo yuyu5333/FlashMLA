@@ -65,6 +65,7 @@ ITERS = int(os.environ.get("PROBE_ITERS", "50"))
 QK_NOPE = 448
 D_QK = 512
 BIT_UNIFORM = int(os.environ.get("PROBE_BIT_UNIFORM", "3"))
+Q_FOLD = int(os.environ.get("PROBE_Q_FOLD", "1"))
 
 p = RawTestParam(
     b=B, h_q=H_Q, s_q=1, h_kv=1, s_kv=S_KV, is_varlen=False, topk=TOPK,
@@ -126,10 +127,19 @@ packed_kwargs = {
     "bit_uniform": _bu,
 }
 
+q_call = t.q
+q_nope_is_folded = False
+if Q_FOLD and _bu > 0:
+    q_folded = t.q.clone()
+    q_folded[..., :QK_NOPE] = torch.matmul(t.q[..., :QK_NOPE], cfg_gpu["R_bf16"])
+    q_call = q_folded
+    q_nope_is_folded = True
+    print("[probe] q_nope_is_folded=True (q_nope @ R, producer writes x directly)")
+
 
 def one_call():
     return flash_mla.flash_mla_with_kvcache(
-        q=t.q,
+        q=q_call,
         k_cache=k_cache,
         head_dim_v=p.d_v,
         block_table=None,
@@ -140,6 +150,7 @@ def one_call():
         indices=indices,
         topk_length=kv_scope.topk_length,
         attn_sink=t.attn_sink,
+        q_nope_is_folded=q_nope_is_folded,
         **packed_kwargs,
     )[0]
 

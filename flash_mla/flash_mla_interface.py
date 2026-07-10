@@ -81,6 +81,10 @@ def flash_mla_with_kvcache(
     # 0 -> legacy variable-bit layout (default, byte-identical to
     # pre-step-5). >0 -> uniform N-bit codes + per-group fp16 affine.
     bit_uniform: int = 0,
+    # Folded-Q path: q carries q_nope @ R for packed orig blocks, while
+    # q_for_extra (when present) preserves original Q for native extra blocks.
+    q_for_extra: Optional[torch.Tensor] = None,
+    q_nope_is_folded: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -177,6 +181,8 @@ def flash_mla_with_kvcache(
             packed_kcache, scale_kcache, R_matrix, zero_point,
             dim_of_bit, bitpos_in_dim,
             bit_uniform,
+            q_for_extra,
+            q_nope_is_folded,
         )
     else:
         # Dense attention
