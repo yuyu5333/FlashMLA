@@ -53,7 +53,11 @@ torch.set_default_dtype(torch.bfloat16)
 
 # ---- production-like MODEL1 swa decode workload ----
 B = int(os.environ.get("PROBE_B", "32"))
-H_Q = 128
+# Production DSV4 uses num_attention_heads=64 (config.json), so h_q=64 ->
+# CLUSTER_SIZE=1 -> wgmma_uniform_supported path reads R_bf16 (correct). H_Q=128
+# would give CLUSTER_SIZE=2 -> legacy branch that reads the null fp32 R_matrix_ptr
+# (IMA at splitkv_mla.cuh:1488). Match production exactly.
+H_Q = int(os.environ.get("PROBE_HQ", "64"))
 S_KV = int(os.environ.get("PROBE_SKV", "4096"))
 TOPK = int(os.environ.get("PROBE_TOPK", "512"))
 BLOCK_SIZE = int(os.environ.get("PROBE_BLK", "64"))
