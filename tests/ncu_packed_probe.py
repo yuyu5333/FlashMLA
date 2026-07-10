@@ -41,6 +41,12 @@ from sglang.jit_kernel.rotated_quant_dsv4_kernels import (
 )
 
 dev = torch.device("cuda:0")
+# The FlashMLA testcase generator (lib.generate_testcase_for_decode ->
+# _randperm_batch) allocates helper tensors on the *default* device. Match the
+# validated tests (test_flash_mla_sparse_decoding.py:240) so cuda tensors and
+# cpu helpers don't collide.
+torch.set_default_device(dev)
+torch.cuda.set_device(dev)
 
 # ---- production-like MODEL1 swa decode workload ----
 B = int(os.environ.get("PROBE_B", "32"))
