@@ -66,6 +66,10 @@ QK_NOPE = 448
 D_QK = 512
 BIT_UNIFORM = int(os.environ.get("PROBE_BIT_UNIFORM", "3"))
 Q_FOLD = int(os.environ.get("PROBE_Q_FOLD", "1"))
+COMPARE = int(os.environ.get("PROBE_COMPARE", "0"))
+R_IDENTITY = int(os.environ.get("PROBE_R_IDENTITY", "0"))
+Q_FOLD_FP32 = int(os.environ.get("PROBE_Q_FOLD_FP32", "0"))
+IDENTITY_TAIL_BYPASS = int(os.environ.get("PROBE_IDENTITY_TAIL_BYPASS", "0"))
 
 p = RawTestParam(
     b=B, h_q=H_Q, s_q=1, h_kv=1, s_kv=S_KV, is_varlen=False, topk=TOPK,
@@ -89,6 +93,9 @@ print(f"[probe] b={B} topk={TOPK} block={BLOCK_SIZE} num_rows={num_rows} "
 
 # ---- build byte-correct packed cache, row layout == indices_in_kvcache ----
 cfg = build_synthetic_dsv4_calibration(1, QK_NOPE)[0]
+if R_IDENTITY:
+    cfg.R = torch.eye(QK_NOPE, dtype=torch.float32)
+    print("[probe] PROBE_R_IDENTITY=1 (store/load R is identity)")
 row_bytes_nope = cfg.row_bytes
 bpt = packed_bytes_per_token(row_bytes_nope, cfg.bit_uniform)
 print(f"[probe] bit_uniform={cfg.bit_uniform} row_bytes_nope={row_bytes_nope} "
@@ -129,17 +136,24 @@ packed_kwargs = {
 
 q_call = t.q
 q_nope_is_folded = False
+q_folded = None
 if Q_FOLD and _bu > 0:
     q_folded = t.q.clone()
-    q_folded[..., :QK_NOPE] = torch.matmul(t.q[..., :QK_NOPE], cfg_gpu["R_bf16"])
+    if Q_FOLD_FP32:
+        q_folded[..., :QK_NOPE] = torch.matmul(
+            t.q[..., :QK_NOPE].float(), cfg_gpu["R"]
+        ).to(t.q.dtype)
+        print("[probe] q fold matmul uses fp32 q/R then casts to bf16")
+    else:
+        q_folded[..., :QK_NOPE] = torch.matmul(t.q[..., :QK_NOPE], cfg_gpu["R_bf16"])
     q_call = q_folded
     q_nope_is_folded = True
     print("[probe] q_nope_is_folded=True (q_nope @ R, producer writes x directly)")
 
 
-def one_call():
+def one_call(q_arg=q_call, folded=q_nope_is_folded):
     return flash_mla.flash_mla_with_kvcache(
-        q=q_call,
+        q=q_arg,
         k_cache=k_cache,
         head_dim_v=p.d_v,
         block_table=None,
@@ -150,15 +164,48 @@ def one_call():
         indices=indices,
         topk_length=kv_scope.topk_length,
         attn_sink=t.attn_sink,
-        q_nope_is_folded=q_nope_is_folded,
+        q_nope_is_folded=folded,
+        identity_tail_bypass=bool(IDENTITY_TAIL_BYPASS),
         **packed_kwargs,
     )[0]
+
+
+def print_diff(name, ref, cur):
+    ref_f = ref.float().flatten()
+    cur_f = cur.float().flatten()
+    diff = (ref_f - cur_f).abs()
+    denom = ref_f.abs().mean().clamp_min(1e-8)
+    cos = torch.nn.functional.cosine_similarity(ref_f, cur_f, dim=0)
+    print(
+        f"[probe][compare] {name}: "
+        f"max_abs={diff.max().item():.6g} mean_abs={diff.mean().item():.6g} "
+        f"rel_mean={float(diff.mean() / denom):.6g} cos={cos.item():.9f}"
+    )
 
 
 out = one_call()
 torch.cuda.synchronize()
 print(f"[probe] out.shape={tuple(out.shape)} "
       f"finite={torch.isfinite(out).all().item()}")
+
+if COMPARE and _bu > 0:
+    old_tail_bypass = IDENTITY_TAIL_BYPASS
+    IDENTITY_TAIL_BYPASS = 0
+    out_base = one_call(t.q, False)
+    torch.cuda.synchronize()
+    if q_folded is None:
+        q_folded = t.q.clone()
+        if Q_FOLD_FP32:
+            q_folded[..., :QK_NOPE] = torch.matmul(
+                t.q[..., :QK_NOPE].float(), cfg_gpu["R"]
+            ).to(t.q.dtype)
+        else:
+            q_folded[..., :QK_NOPE] = torch.matmul(t.q[..., :QK_NOPE], cfg_gpu["R_bf16"])
+    IDENTITY_TAIL_BYPASS = old_tail_bypass
+    out_cmp_q = q_folded if q_nope_is_folded else t.q
+    out_fold = one_call(out_cmp_q, q_nope_is_folded)
+    torch.cuda.synchronize()
+    print_diff("base_vs_probe_path", out_base, out_fold)
 
 for _ in range(ITERS):
     one_call()

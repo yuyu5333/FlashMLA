@@ -41,7 +41,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bitpos_in_dim")  = py::none(),
           py::arg("bit_uniform")    = (int64_t)0,
           py::arg("q_for_extra")    = py::none(),
-          py::arg("q_nope_is_folded") = false);
+          py::arg("q_nope_is_folded") = false,
+          py::arg("identity_tail_bypass") = false);
     m.def("dense_decode_fwd", &dense_attn_decode_interface);
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);

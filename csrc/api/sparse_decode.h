@@ -318,7 +318,8 @@ sparse_attn_decode_interface(
     // affine (min, range) lives in fp16 header at end of packed row.
     int64_t bit_uniform                            = 0,
     const std::optional<at::Tensor> &q_for_extra   = std::nullopt,
-    bool q_nope_is_folded                          = false
+    bool q_nope_is_folded                          = false,
+    bool identity_tail_bypass                      = false
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -666,6 +667,8 @@ sparse_attn_decode_interface(
             "Got non-None count=", num_packed_present);
         TORCH_CHECK(!q_nope_is_folded || num_packed_present == 6,
             "q_nope_is_folded requires the packed-FP8 sparse path");
+        TORCH_CHECK(!identity_tail_bypass || num_packed_present == 6,
+            "identity_tail_bypass requires the packed-FP8 sparse path");
 
         if (num_packed_present == 6) {
             const at::Tensor &pk = packed_kcache.value();
@@ -728,6 +731,9 @@ sparse_attn_decode_interface(
             // header. bit_uniform == 0 keeps legacy.
             params.bit_uniform = static_cast<int>(bit_uniform);
             params.q_nope_is_folded = q_nope_is_folded ? 1 : 0;
+            params.identity_tail_bypass = identity_tail_bypass ? 1 : 0;
+            TORCH_CHECK(!identity_tail_bypass || params.bit_uniform > 0,
+                "identity_tail_bypass requires bit_uniform>0");
             if (params.bit_uniform > 0) {
                 params.uniform_group_size = 64;
                 TORCH_CHECK(qk_nope_head_dim_val % 64 == 0,
@@ -738,6 +744,9 @@ sparse_attn_decode_interface(
                 // 2x fp16 per group: (min, range).
                 params.uniform_header_bytes =
                     params.uniform_num_groups * 4;
+                TORCH_CHECK(!identity_tail_bypass || qk_nope_head_dim_val == 448,
+                    "identity_tail_bypass expects synthetic DSv4 qk_nope_head_dim=448, got ",
+                    qk_nope_head_dim_val);
             }
         }
     }

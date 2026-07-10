@@ -173,6 +173,7 @@ struct SparseAttnDecodeParams {
     int                 uniform_group_size    = 64;
     int                 uniform_num_groups    = 0;
     int                 q_nope_is_folded      = 0;
+    int                 identity_tail_bypass  = 0;
 };
 
 struct CombineParams {

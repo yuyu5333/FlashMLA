@@ -85,6 +85,7 @@ def flash_mla_with_kvcache(
     # q_for_extra (when present) preserves original Q for native extra blocks.
     q_for_extra: Optional[torch.Tensor] = None,
     q_nope_is_folded: bool = False,
+    identity_tail_bypass: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -183,6 +184,7 @@ def flash_mla_with_kvcache(
             bit_uniform,
             q_for_extra,
             q_nope_is_folded,
+            identity_tail_bypass,
         )
     else:
         # Dense attention

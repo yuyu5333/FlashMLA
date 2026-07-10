@@ -1021,7 +1021,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   Byte-identical: same sX_tile(t,d) mapping, same math.
                         const int fx_d = idx_in_warpgroup & 63;
                         const int fx_th = idx_in_warpgroup >> 6;   // 0 or 1
-                        auto fill_sX_tile = [&](int k_base) {
+                        auto fill_sX_tile = [&](int k_base, bool direct_staging = false) {
                             const int d = fx_d;
                             const int d_global = k_base + d;
                             const int bit_off_global = d_global * bu;
@@ -1074,9 +1074,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                     const float fstep = __half2float(__high2half(hdr));
                                     x_val = fmaf((float)code, fstep, fmin);
                                 }
-                                if (params.q_nope_is_folded) {
-                                    // Folded-Q direct path does not feed wgmma;
-                                    // keep staging row-major so the existing
+                                if (direct_staging) {
+                                    // Direct paths do not feed wgmma; keep
+                                    // staging row-major so the existing
                                     // staging->sK vector store layout is reused.
                                     staging[t * 64 + d] = bf16(x_val);
                                 } else {
@@ -1163,6 +1163,26 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                         };
 
+                        auto write_staging_tile_to_sK = [&](int dim_base) {
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                            CUTE_UNROLL
+                            for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
+                                int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
+                                const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
+                                const int dim_in_block = (lane_idx / 8) * 16;
+                                bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
+                                    plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0);
+                                bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
+                                    plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8);
+                                bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                    + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
+                                *(__int128_t*)(sK_nope_base + (dim_base + 0) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_lo;
+                                *(__int128_t*)(sK_nope_base + (dim_base + 8) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_hi;
+                            }
+                            NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                        };
+
                         // [step3m] fill_sX redundancy elimination via GROUPED
                         //   kt-outer / dim-inner reorder.
                         //
@@ -1239,24 +1259,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 if (grp0 != 0) break;
                                 for (int kt = 0; kt < k_tiles; ++kt) {
                                     const int k_base = kt * 64;
-                                    fill_sX_tile(k_base);
-                                    cutlass::arch::fence_view_async_shared();
-                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
-                                    CUTE_UNROLL
-                                    for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
-                                        int my_token_idx = my_token_idx_base + round * NUM_TOKENS_PER_ROUND;
-                                        const int abs_token = idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx;
-                                        const int dim_in_block = (lane_idx / 8) * 16;
-                                        bf16x8 val_lo = *reinterpret_cast<bf16x8*>(
-                                            plan.packed_nope_staging + abs_token * 64 + dim_in_block + 0);
-                                        bf16x8 val_hi = *reinterpret_cast<bf16x8*>(
-                                            plan.packed_nope_staging + abs_token * 64 + dim_in_block + 8);
-                                        bf16* sK_nope_base = plan.u.k[buf_idx].data()
-                                            + abs_token * 8 + ((lane_idx / 8) * 16) * TOPK_BLOCK_SIZE;
-                                        *(__int128_t*)(sK_nope_base + (k_base + 0) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_lo;
-                                        *(__int128_t*)(sK_nope_base + (k_base + 8) * TOPK_BLOCK_SIZE) = *(__int128_t*)&val_hi;
-                                    }
-                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
+                                    fill_sX_tile(k_base, true);
+                                    write_staging_tile_to_sK(k_base);
+                                }
+                                continue;
+                            }
+
+                            if (params.identity_tail_bypass && grp0 >= 4) {
+                                // build_hadamard(448) is block-diagonal:
+                                // a 256-dim Hadamard prefix plus a 192-dim
+                                // identity tail. For dim blocks 4..6, R@X is
+                                // exactly X, so keep K-side math/rounding for
+                                // the Hadamard prefix and only bypass the
+                                // identity tail.
+                                for (int kt = grp0; kt < grp0 + G; ++kt) {
+                                    const int k_base = kt * 64;
+                                    fill_sX_tile(k_base, true);
+                                    write_staging_tile_to_sK(k_base);
                                 }
                                 continue;
                             }
