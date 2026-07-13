@@ -106,11 +106,21 @@ print(f"packed_rows.shape  = {tuple(packed_rows.shape)}  dtype={packed_rows.dtyp
 print(f"总字节数           = {packed_cache.numel()} B "
       f"({packed_cache.numel() / 1024 / 1024:.2f} MiB)")
 
-# ---- dump 前 N 个 token 的原始字节 ----
+# ---- 找有真实数据的 token（testcase 前面的行常是未用 slot=0）----
+row_absmax = kv_src[:, :QK_NOPE].abs().amax(dim=1)
+nonzero_rows = torch.nonzero(row_absmax > 1e-6, as_tuple=False).flatten()
+if nonzero_rows.numel() > 0:
+    dump_ids = nonzero_rows[:N_DUMP].cpu().tolist()
+else:
+    dump_ids = list(range(min(N_DUMP, num_rows)))
+print(f"\n[info] 非零(有真实KV)的 token 行数 = {nonzero_rows.numel()} / {num_rows}")
+print(f"[info] 将 dump 这些行: {dump_ids}")
+
+# ---- dump N 个有数据 token 的原始字节 ----
 print("\n" + "=" * 72)
-print(f"前 {N_DUMP} 个 token 的原始 packed bytes (hex)")
+print(f"选取的 {len(dump_ids)} 个有真实数据 token 的原始 packed bytes (hex)")
 print("=" * 72)
-for i in range(min(N_DUMP, num_rows)):
+for i in dump_ids:
     row = packed_rows[i].cpu()
     nope_codes = row[:row_bytes_nope]
     header = row[row_bytes_nope:row_bytes_nope + _UNIFORM_HEADER_BYTES]
@@ -129,12 +139,13 @@ print("\n" + "=" * 72)
 print("解包正确性验证 (CPU reference dequant vs 原始 bf16)")
 print("=" * 72)
 M_check = min(256, num_rows)
-idx = torch.arange(M_check, dtype=torch.int64, device=dev)
+# CPU reference: cfg.R 在 CPU，因此把 cache/indices 也放到 CPU 上跑，避免 device 混用
+idx = torch.arange(M_check, dtype=torch.int64, device="cpu")
 nope_recon, rope_recon, _ = rotated_load_to_fp8_layout_cpu_ref(
-    packed_cache, idx, page_size=PAGE_SIZE, cfg=cfg,
+    packed_cache.cpu(), idx, page_size=PAGE_SIZE, cfg=cfg,
 )
-orig_nope = kv_src[:M_check, :QK_NOPE].float()
-recon_nope = nope_recon.float()
+orig_nope = kv_src[:M_check, :QK_NOPE].float().cpu()
+recon_nope = nope_recon.float().cpu()
 diff = (orig_nope - recon_nope).abs()
 cos = torch.nn.functional.cosine_similarity(
     orig_nope.flatten(), recon_nope.flatten(), dim=0
@@ -143,8 +154,8 @@ print(f"nope  max_abs_err = {diff.max().item():.6g}")
 print(f"nope  mean_abs_err= {diff.mean().item():.6g}")
 print(f"nope  cos_sim     = {cos.item():.9f}   (量化误差, 3bit 预期 cos>0.99)")
 
-orig_rope = kv_src[:M_check, QK_NOPE:].float()
-recon_rope = rope_recon.float()
+orig_rope = kv_src[:M_check, QK_NOPE:].float().cpu()
+recon_rope = rope_recon.float().cpu()
 rope_diff = (orig_rope - recon_rope).abs()
 print(f"rope  max_abs_err = {rope_diff.max().item():.6g}   (rope BF16 无损, 应≈0)")
 
