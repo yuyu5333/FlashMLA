@@ -130,7 +130,11 @@
 //   228KB cap) and the memory main-line. Counters DISABLED for production; the
 //   fill_sR split was reverted so this production build is code-identical to
 //   step3u (130c8ef) except comments.
-#define FMLA_CLK_PROFILE 1
+// [2026-07-13 step4b] DISABLED for the production step4b build: the clock64
+//   counters inflate Duration/inst and the cudaMemcpyFromSymbol readback is a
+//   stream sync illegal under cgon capture. Re-enable only for segment
+//   profiling at cgoff.
+// #define FMLA_CLK_PROFILE 1
 
 // [Route H step4a] fold-rotation EXECUTION-PATH PROBE toggle.
 //   When defined, the packed producer keeps the fill_sX unpack (x = code*step
