@@ -139,11 +139,14 @@ print("\n" + "=" * 72)
 print("解包正确性验证 (CPU reference dequant vs 原始 bf16)")
 print("=" * 72)
 M_check = min(256, num_rows)
-# CPU reference: cfg.R 在 CPU，因此把 cache/indices 也放到 CPU 上跑，避免 device 混用
+# CPU reference: cfg.R 在 CPU，且 bitunpack 内部会用默认 device 建 arange，
+# 因此临时把默认 device 切回 CPU，全程 CPU 张量，避免 device 混用。
+torch.set_default_device("cpu")
 idx = torch.arange(M_check, dtype=torch.int64, device="cpu")
 nope_recon, rope_recon, _ = rotated_load_to_fp8_layout_cpu_ref(
     packed_cache.cpu(), idx, page_size=PAGE_SIZE, cfg=cfg,
 )
+torch.set_default_device(dev)
 orig_nope = kv_src[:M_check, :QK_NOPE].float().cpu()
 recon_nope = nope_recon.float().cpu()
 diff = (orig_nope - recon_nope).abs()
