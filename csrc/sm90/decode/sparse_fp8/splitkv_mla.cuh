@@ -1011,6 +1011,27 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const int g = d_global / u_group_size;
                             const int hdr_base = g * TOPK_BLOCK_SIZE;   // [step3q] s_hdr row for this group
 
+                            // [step4b] bu==4 nibble-aligned compile-time-constant
+                            //   fast path. When bit_uniform==4 every 4-bit code
+                            //   is a nibble whose bit offset is d_global*4, so
+                            //   byte_off4 = d_global>>1 and shift4 = (d_global&1)*4
+                            //   in {0,4}: the code NEVER crosses a byte boundary
+                            //   (shift4+4 <= 8), so a SINGLE 1-byte load holds the
+                            //   whole code and the mask is the literal 0xF. This
+                            //   differs from the rejected step4a byte-align: the
+                            //   bu==4 vs generic split is done ONCE per 32-element
+                            //   phase (bu is warp-uniform -> no divergence, no
+                            //   per-element runtime branch), so it removes the
+                            //   generic path's 2nd byte OR + runtime (1<<bu)-1 mask
+                            //   arithmetic without the +727K per-element branch
+                            //   instructions that killed step4a. Value-identical
+                            //   to generic for bu==4: the generic word's low byte
+                            //   is exactly pk_row[byte_off], and shift4==shift,
+                            //   mask 0xF == (1<<4)-1.
+                            const bool bu4 = (bu == 4);
+                            const int byte_off4 = d_global >> 1;         // (d_global*4)>>3
+                            const int shift4 = (d_global & 1) << 2;      // (d_global*4)&7 in {0,4}
+
                             // [step3u] load/compute split. fill_sX is
                             //   latency-bound scattered per-token global reads
                             //   (step3t: pure_unpack 258K cyc/block = 98% of
@@ -1027,58 +1048,99 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             //   phase. Value-identical: same word bytes, same
                             //   fmaf, same bf16 store, only the schedule moves.
                             uint32_t words[32];
-                            CUTE_UNROLL
-                            for (int e = 0; e < 32; ++e) {
-                                const int t = e * 2 + fx_th;
-                                const uint8_t* pk_row = s_pk_row[t];
-                                uint32_t word = 0u;
-                                if (pk_row != nullptr) {
+                            if (bu4) {
+                                // [step4b] nibble-aligned single-byte load.
+                                //   byte_off4 == byte_off for bu==4; the code is
+                                //   wholly inside this one byte (shift4+4<=8), so
+                                //   the 2nd-byte OR + (bu>8) test are dropped. The
+                                //   branch is warp-uniform (hoisted out of the
+                                //   32-loop) so the inner body is straight-line.
+                                CUTE_UNROLL
+                                for (int e = 0; e < 32; ++e) {
+                                    const int t = e * 2 + fx_th;
+                                    const uint8_t* pk_row = s_pk_row[t];
+                                    words[e] = (pk_row != nullptr)
+                                        ? (uint32_t)pk_row[byte_off4] : 0u;
+                                }
+                            } else {
+                                CUTE_UNROLL
+                                for (int e = 0; e < 32; ++e) {
+                                    const int t = e * 2 + fx_th;
+                                    const uint8_t* pk_row = s_pk_row[t];
+                                    uint32_t word = 0u;
+                                    if (pk_row != nullptr) {
 #if defined(FMLA_ENABLE_U32_LOAD_ORACLE)
-                                    if (use_u32_load) {
-                                        // Debug/probe-only oracle path for the
-                                        // rejected u32-load experiment. Keep it
-                                        // runtime-gated so the default byte-load
-                                        // production path is unchanged.
-                                        word = __ldg(reinterpret_cast<const uint32_t*>(
-                                            pk_row + word_byte_off));
-                                    } else {
+                                        if (use_u32_load) {
+                                            // Debug/probe-only oracle path for the
+                                            // rejected u32-load experiment. Keep it
+                                            // runtime-gated so the default byte-load
+                                            // production path is unchanged.
+                                            word = __ldg(reinterpret_cast<const uint32_t*>(
+                                                pk_row + word_byte_off));
+                                        } else {
+                                            word = (uint32_t)pk_row[byte_off];
+                                            word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
+                                            if (bu > 8) {
+                                                word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
+                                            }
+                                        }
+#else
                                         word = (uint32_t)pk_row[byte_off];
                                         word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
                                         if (bu > 8) {
                                             word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                         }
-                                    }
-#else
-                                    word = (uint32_t)pk_row[byte_off];
-                                    word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
-                                    if (bu > 8) {
-                                        word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
-                                    }
 #endif
+                                    }
+                                    words[e] = word;
                                 }
-                                words[e] = word;
                             }
-                            CUTE_UNROLL
-                            for (int e = 0; e < 32; ++e) {
-                                const int t = e * 2 + fx_th;
-                                float x_val = 0.0f;
-                                if (s_pk_row[t] != nullptr) {
-                                    const int code = (int)((words[e] >> decode_shift) & mask);
-                                    // [step3q] (fmin, fstep) pre-divided + cached
-                                    //   in s_hdr; hot loop just widens + fmaf,
-                                    //   no per-element frange/denom division.
-                                    const __half2 hdr = s_hdr[hdr_base + t];
-                                    const float fmin = __half2float(__low2half(hdr));
-                                    const float fstep = __half2float(__high2half(hdr));
-                                    x_val = fmaf((float)code, fstep, fmin);
+                            if (bu4) {
+                                // [step4b] constant shift4/0xF decode. Value-
+                                //   identical to generic for bu==4 (shift4==shift,
+                                //   0xF==(1<<4)-1) but the compiler folds the
+                                //   literal mask + shift, dropping the runtime
+                                //   (1<<bu)-1 and variable-shift arithmetic.
+                                CUTE_UNROLL
+                                for (int e = 0; e < 32; ++e) {
+                                    const int t = e * 2 + fx_th;
+                                    float x_val = 0.0f;
+                                    if (s_pk_row[t] != nullptr) {
+                                        const int code = (int)((words[e] >> shift4) & 0xFu);
+                                        const __half2 hdr = s_hdr[hdr_base + t];
+                                        const float fmin = __half2float(__low2half(hdr));
+                                        const float fstep = __half2float(__high2half(hdr));
+                                        x_val = fmaf((float)code, fstep, fmin);
+                                    }
+                                    if (direct_staging) {
+                                        staging[t * 64 + d] = bf16(x_val);
+                                    } else {
+                                        sX_tile(t, d) = bf16(x_val);
+                                    }
                                 }
-                                if (direct_staging) {
-                                    // Direct paths do not feed wgmma; keep
-                                    // staging row-major so the existing
-                                    // staging->sK vector store layout is reused.
-                                    staging[t * 64 + d] = bf16(x_val);
-                                } else {
-                                    sX_tile(t, d) = bf16(x_val);
+                            } else {
+                                CUTE_UNROLL
+                                for (int e = 0; e < 32; ++e) {
+                                    const int t = e * 2 + fx_th;
+                                    float x_val = 0.0f;
+                                    if (s_pk_row[t] != nullptr) {
+                                        const int code = (int)((words[e] >> decode_shift) & mask);
+                                        // [step3q] (fmin, fstep) pre-divided + cached
+                                        //   in s_hdr; hot loop just widens + fmaf,
+                                        //   no per-element frange/denom division.
+                                        const __half2 hdr = s_hdr[hdr_base + t];
+                                        const float fmin = __half2float(__low2half(hdr));
+                                        const float fstep = __half2float(__high2half(hdr));
+                                        x_val = fmaf((float)code, fstep, fmin);
+                                    }
+                                    if (direct_staging) {
+                                        // Direct paths do not feed wgmma; keep
+                                        // staging row-major so the existing
+                                        // staging->sK vector store layout is reused.
+                                        staging[t * 64 + d] = bf16(x_val);
+                                    } else {
+                                        sX_tile(t, d) = bf16(x_val);
+                                    }
                                 }
                             }
                         };
