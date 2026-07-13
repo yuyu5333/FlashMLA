@@ -1028,7 +1028,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             //   to generic for bu==4: the generic word's low byte
                             //   is exactly pk_row[byte_off], and shift4==shift,
                             //   mask 0xF == (1<<4)-1.
-                            const bool bu4 = (bu == 4);
+                            const bool bu4 = (bu == 4)
+#if defined(FMLA_ENABLE_U32_LOAD_ORACLE)
+                                // [step4b oracle] When built with the oracle
+                                //   macro, debug_u32_packed_load=1 forces the
+                                //   GENERIC path even at bu==4 so the probe's
+                                //   COMPARE_U32_LOAD (fast=0 vs generic=1) is a
+                                //   single-process byte-level equivalence check.
+                                //   Production build (macro undefined) keeps
+                                //   bu4 = (bu==4): always the fast path.
+                                && !params.debug_u32_packed_load
+#endif
+                                ;
                             const int byte_off4 = d_global >> 1;         // (d_global*4)>>3
                             const int shift4 = (d_global & 1) << 2;      // (d_global*4)&7 in {0,4}
 
