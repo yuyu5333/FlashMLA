@@ -1010,23 +1010,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const uint32_t mask = (1u << bu) - 1u;
                             const int g = d_global / u_group_size;
                             const int hdr_base = g * TOPK_BLOCK_SIZE;   // [step3q] s_hdr row for this group
-                            // [step4a byte-aligned load] The code for this thread's
-                            //   dim lives at bit [shift, shift+bu) of the little-
-                            //   endian word starting at byte_off. The number of
-                            //   packed-row bytes it actually touches is
-                            //   ceil((shift+bu)/8). For byte-ALIGNED widths
-                            //   (bu in {1,2,4,8}) shift is a multiple of bu so
-                            //   shift+bu <= 8 => a SINGLE byte holds the whole
-                            //   code; the old unconditional 2-byte (bu<=8) /
-                            //   3-byte (bu>8) load wasted 1-2 scattered global
-                            //   loads per element. fill_sX is the 258K-cyc/block
-                            //   memory-latency wall (98% of seg-7, step3t), so
-                            //   dropping the dead high-byte load HALVES the
-                            //   scattered LDG count for bu=4 (byte-identical: the
-                            //   dropped bytes were masked off anyway). n_load_bytes
-                            //   is a per-thread constant (shift/bu constant per
-                            //   thread) so it is computed ONCE outside the e-loop.
-                            const int code_span_bytes = (decode_shift + bu + 7) >> 3;
 
                             // [step3u] load/compute split. fill_sX is
                             //   latency-bound scattered per-token global reads
@@ -1066,16 +1049,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         }
                                     }
 #else
-                                    // [step4a] Only load the bytes the code
-                                    //   actually spans (code_span_bytes = per-
-                                    //   thread constant). For bu=4 this is a
-                                    //   single byte (no wasted high-byte LDG);
-                                    //   for bu=3 it stays 2; for bu>8 up to 3.
                                     word = (uint32_t)pk_row[byte_off];
-                                    if (code_span_bytes > 1) {
-                                        word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
-                                    }
-                                    if (code_span_bytes > 2) {
+                                    word |= ((uint32_t)pk_row[byte_off + 1]) << 8;
+                                    if (bu > 8) {
                                         word |= ((uint32_t)pk_row[byte_off + 2]) << 16;
                                     }
 #endif
