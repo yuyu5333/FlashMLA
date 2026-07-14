@@ -154,7 +154,6 @@
 //   scatter (2%) = the entire R-related producer cost, on the CORRECT
 //   fa68162 consumer / 165tps baseline. Comment out for production.
 // #define FMLA_FOLD_ROT_PROBE2 1
-#define FMLA_FOLD_ROT_PROBE2 1
 
 #include "splitkv_mla.h"
 
@@ -1065,18 +1064,24 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             //   fmaf, same bf16 store, only the schedule moves.
                             uint32_t words[32];
                             if (bu4) {
-                                // [step4b] nibble-aligned single-byte load.
+                                // [step4d] lane-paired nibble load.
                                 //   byte_off4 == byte_off for bu==4; the code is
                                 //   wholly inside this one byte (shift4+4<=8), so
-                                //   the 2nd-byte OR + (bu>8) test are dropped. The
-                                //   branch is warp-uniform (hoisted out of the
-                                //   32-loop) so the inner body is straight-line.
+                                //   adjacent d lanes (2m, 2m+1) need the same byte
+                                //   and select low/high nibble via shift4. Load it
+                                //   once in the even lane, then broadcast to the
+                                //   odd lane with xor-1 shuffle. This preserves the
+                                //   step4b decode exactly while halving the bu4
+                                //   scattered per-token byte loads.
                                 CUTE_UNROLL
                                 for (int e = 0; e < 32; ++e) {
                                     const int t = e * 2 + fx_th;
                                     const uint8_t* pk_row = s_pk_row[t];
-                                    words[e] = (pk_row != nullptr)
+                                    const uint32_t loaded = ((d & 1) == 0 && pk_row != nullptr)
                                         ? (uint32_t)pk_row[byte_off4] : 0u;
+                                    const uint32_t pair_loaded =
+                                        __shfl_xor_sync(0xffffffffu, loaded, 1);
+                                    words[e] = ((d & 1) == 0) ? loaded : pair_loaded;
                                 }
                             } else {
                                 CUTE_UNROLL
