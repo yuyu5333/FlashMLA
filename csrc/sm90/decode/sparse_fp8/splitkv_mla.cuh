@@ -154,6 +154,7 @@
 //   scatter (2%) = the entire R-related producer cost, on the CORRECT
 //   fa68162 consumer / 165tps baseline. Comment out for production.
 // #define FMLA_FOLD_ROT_PROBE2 1
+#define FMLA_FOLD_ROT_PROBE2 1
 
 #include "splitkv_mla.h"
 
@@ -1322,6 +1323,24 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 #endif
                         };
 
+#ifdef FMLA_FOLD_ROT_PROBE2
+                        // [Route H step4a] fold-rotation EXECUTION-PATH probe.
+                        //   Unpack each of the 7 x k-tiles and write it STRAIGHT
+                        //   to sK nope (direct_staging + write_staging_tile_to_sK),
+                        //   skipping fill_sR + the R@X wgmma + scatter_rC_to_sK.
+                        //   This is the exact producer path the full Q@R fold
+                        //   design (Q_folded = Q_nope @ R in consumer, K = x) will
+                        //   run, so it measures the decode-tps CEILING of removing
+                        //   R@X from the KV side. Output is intentionally salad
+                        //   (Q is NOT folded here). PERF probe only, gated by
+                        //   end-to-end decode tps, NOT correctness.
+                        CUTE_NO_UNROLL
+                        for (int kt = 0; kt < k_tiles; ++kt) {
+                            const int k_base = kt * 64;
+                            fill_sX_tile(k_base, true);
+                            write_staging_tile_to_sK(k_base);
+                        }
+#else
                         CUTE_NO_UNROLL
                         for (int grp0 = 0; grp0 < DIM_BLOCKS; grp0 += RC_GROUP) {
                             const int rem = DIM_BLOCKS - grp0;
@@ -1390,6 +1409,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             if (idx_in_warpgroup == 0) fmla_clk_add(10, _clk_s5 - _clk_s4);
 #endif
                         }
+#endif  // FMLA_FOLD_ROT_PROBE2
 
                         cutlass::arch::fence_view_async_shared();
                         // Fall through to shared bar_k_local_ready arrive +
