@@ -67,7 +67,26 @@
 //     tps NEUTRAL -> the producer (incl. decode膨胀) is fully hidden behind
 //                    the 1-block/SM latency wall; occupancy is the only
 //                    remaining lever, justifying the smem-reduction surgery.
-#define FMLA_PRODUCER_NULL_PROBE 1
+//
+// [Route H step5b RESULT] Probe measured bu4 cgon decode bench tps = 940.93
+//   (TPOT 27.89ms), vs step4d byte-correct baseline 944.72 (TPOT 27.14ms):
+//   -0.40% tps / +2.8% TPOT = NEUTRAL, within run noise. Zeroing the ENTIRE
+//   producer nope rebuild -- INCLUDING the fill_sX bit-unpack DECODE
+//   instruction膨胀 (shift4/mask/fmaf) that NCU_ROOTCAUSE_2606 flagged as
+//   inst 6.85x / shared_ld 62.7x -- on the CORRECT fa68162 consumer gave
+//   ZERO tps gain. This is the FIRST experiment ever to zero the decode
+//   instruction膨胀 on the correct consumer, and it is DECISIVE: producer
+//   decode simplification (LUT / warp-coop unpack) buys NOTHING end-to-end
+//   because the producer (loads + decode + wgmma + barriers) is fully hidden
+//   behind the 1-block/SM latency wall. The consumer sits idle on the buffer
+//   handshake regardless of how cheap the producer is. Combined with step2a /
+//   step3b / step4a-PROBE2 / step5a, the producer is now exonerated across
+//   FIVE independent negative experiments. OCCUPANCY is the ONLY remaining
+//   lever: enabling >1 block/SM co-residency (currently smem-blocked by
+//   SmemPlan 225280 B > ~116KB needed for 2 blocks under the 232448 B dyn-smem
+//   cap) so block A's idle consumer overlaps block B's producer. Next: reduce
+//   SharedMemoryPlan to <=116KB/block. Probe DISABLED (byte-correct).
+// #define FMLA_PRODUCER_NULL_PROBE 1
 
 // [Route H step3k] in-kernel clock64 SEGMENT PROFILE toggle.
 //   When defined, one representative thread per block accumulates clock64()
