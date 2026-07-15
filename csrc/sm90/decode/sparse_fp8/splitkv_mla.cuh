@@ -91,7 +91,11 @@
 //   direct-copy + handshake survive. per-call = 329.7us (8 rank, 1290 calls)
 //   vs byte-correct 322.9us (NEUTRAL, +2% noise) -- FIRST kernel-duration
 //   granularity proof that producer nope compute has ZERO per-call cost.
-#define FMLA_PRODUCER_NULL_PROBE 1
+// [Route H step7 done] Probe DISABLED (byte-correct). Both producer-null and
+//   the rope-null probe below were measured NEUTRAL at per-call granularity;
+//   see the rope-null RESULT block for the decisive datum. Production build
+//   carries no probe.
+// #define FMLA_PRODUCER_NULL_PROBE 1
 
 // [Route H step7] rope-gather NULL PROBE toggle (layered on producer-null).
 //   With FMLA_PRODUCER_NULL_PROBE the nope rebuild is already compiled out,
@@ -109,7 +113,20 @@
 //       329us is 100% the 1-block/SM handshake+schedule structure; the ONLY
 //       lever is occupancy (>1 block/SM co-residency), justifying the smem
 //       surgery. Producer memory main-line is fully exonerated.
-#define FMLA_ROPE_NULL_PROBE 1
+// [Route H step7 RESULT] Probe measured rope-null per-call = 329.6us (8 rank,
+//   1290 calls: 329.79/329.47/329.37/329.43/330.02/331.25/329.73/330.02us) vs
+//   producer-null 329.7us -- NEUTRAL, within noise. Zeroing the producer's
+//   ONLY surviving global gather (per-token rope scatter) on top of the
+//   already-nulled nope rebuild moved the per-call floor by 0. The ENTIRE
+//   producer memory main-line (nope loads + nope compute + rope loads + all
+//   producer barriers) has ZERO per-call cost; the 329us floor is 100%
+//   consumer QK/PV chain + 1-block/SM barrier handshake structure. 8th
+//   independent negative experiment, 2nd at kernel-duration granularity.
+//   Cross-checked with STEP6 NCU (occupancy dead-end: reg+smem double-lock
+//   1-block/SM). FlashMLA kernel internals are exhaustively sealed; the e2e
+//   lever is OUTSIDE the kernel (store-side + max_running_requests). Probe
+//   DISABLED (byte-correct).
+// #define FMLA_ROPE_NULL_PROBE 1
 
 // [Route H step3k] in-kernel clock64 SEGMENT PROFILE toggle.
 //   When defined, one representative thread per block accumulates clock64()
