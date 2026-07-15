@@ -136,6 +136,16 @@ packed_kwargs = {
     "bit_uniform": _bu,
 }
 
+# [Route H step6] PROBE_NATIVE=1 drops ALL packed kwargs so the SAME kernel
+# takes the native FP8 producer branch (params.packed_kcache_ptr == nullptr)
+# on the IDENTICAL k_cache / indices / q workload. This is the apples-to-apples
+# native-vs-packed comparison NCU needs to attribute the 2.18x decode gap to
+# either the producer skeleton (Stall Barrier), memory latency, or occupancy.
+PROBE_NATIVE = int(os.environ.get("PROBE_NATIVE", "0"))
+if PROBE_NATIVE:
+    packed_kwargs = {}
+    print("[probe] PROBE_NATIVE=1 -> native FP8 producer path (no packed kwargs)")
+
 q_call = t.q
 q_nope_is_folded = False
 q_folded = None
