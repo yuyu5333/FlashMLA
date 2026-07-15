@@ -84,9 +84,32 @@
 //   FIVE independent negative experiments. OCCUPANCY is the ONLY remaining
 //   lever: enabling >1 block/SM co-residency (currently smem-blocked by
 //   SmemPlan 225280 B > ~116KB needed for 2 blocks under the 232448 B dyn-smem
-//   cap) so block A's idle consumer overlaps block B's producer. Next: reduce
+// cap) so block A's idle consumer overlaps block B's producer. Next: reduce
 //   SharedMemoryPlan to <=116KB/block. Probe DISABLED (byte-correct).
-// #define FMLA_PRODUCER_NULL_PROBE 1
+// [Route H step7] RE-ENABLE producer-null probe as the BASELINE for the
+//   rope-null bisection below. Nope rebuild stays compiled out; only rope
+//   direct-copy + handshake survive. per-call = 329.7us (8 rank, 1290 calls)
+//   vs byte-correct 322.9us (NEUTRAL, +2% noise) -- FIRST kernel-duration
+//   granularity proof that producer nope compute has ZERO per-call cost.
+#define FMLA_PRODUCER_NULL_PROBE 1
+
+// [Route H step7] rope-gather NULL PROBE toggle (layered on producer-null).
+//   With FMLA_PRODUCER_NULL_PROBE the nope rebuild is already compiled out,
+//   so the producer's ONLY surviving global-memory activity is the per-token
+//   rope direct-copy scattered gather (pk_row[nope_bytes..], L849-892). This
+//   probe zeroes that gather too: force every rope token down the write-zeros
+//   branch (skip pk_base rope_bf16 reads), leaving the producer as a PURE
+//   handshake (bar_k_avail.wait -> zero-fill sK -> bar_k_local_ready.arrive).
+//   Output is intentionally salad; PERF probe gated by per-call + decode tps.
+//
+//   Bisection of the 329.7us producer-null per-call floor:
+//     per-call DROPS toward native ~39us -> the rope scattered gather is the
+//       memory main-line wall; next lever = cp.async/TMA bulk rope gather.
+//     per-call NEUTRAL (~329us)          -> even rope loads are hidden; the
+//       329us is 100% the 1-block/SM handshake+schedule structure; the ONLY
+//       lever is occupancy (>1 block/SM co-residency), justifying the smem
+//       surgery. Producer memory main-line is fully exonerated.
+#define FMLA_ROPE_NULL_PROBE 1
 
 // [Route H step3k] in-kernel clock64 SEGMENT PROFILE toggle.
 //   When defined, one representative thread per block accumulates clock64()
@@ -856,7 +879,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int token_idx_abs = idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx;
                         const int token_index = __ldg(indices_base + token_idx_abs);
 
+#ifdef FMLA_ROPE_NULL_PROBE
+                        // [Route H step7] force write-zeros: skip the per-token
+                        //   packed-row rope global gather to bisect the 329us
+                        //   producer-null floor into memory-main-line vs
+                        //   handshake structure. Output is salad (PERF probe).
+                        if (false) {
+#else
                         if (token_index != -1) {
+#endif
                             const int block_index = (int)((uint32_t)token_index / (uint32_t)page_block_size);
                             const int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;
                             const uint8_t* pk_row = pk_base
