@@ -155,6 +155,33 @@
 //   fa68162 consumer / 165tps baseline. Comment out for production.
 // #define FMLA_FOLD_ROT_PROBE2 1
 
+// [Route H step5a] fill_sX SCATTERED-GATHER NULL PROBE toggle.
+//   When defined, the bu4 producer load phase skips the actual per-token
+//   packed-row global byte read (pk_row[byte_off4]) and substitutes a
+//   constant `loaded = 0`. Everything else -- the lane-paired xor shuffle,
+//   the code>>shift4 decode, the s_hdr affine fmaf, the bf16 sX_tile store,
+//   the fill_sR loads, the R@X wgmma, the scatter->sK, and ALL producer
+//   NamedBarriers -- runs byte-for-byte unchanged. Output is intentionally
+//   salad (every code decodes to 0 -> x = fmin), so this is a PERF probe
+//   only, gated by end-to-end decode tps, NOT correctness.
+//
+//   Rationale: step3v localized fill_sX = 231K cyc/block (48% of the 477K
+//   producer nope_rebuild) as a latency-bound scattered per-token global
+//   read wall (~575 cyc/element; __ldg null-effect at step3s). The two
+//   negative producer experiments that "exonerated" the producer either
+//   (a) ran on the VOID d557790 consumer (step2a/step3b) or (b) kept
+//   fill_sX and only removed the R-side (PROBE2/step4a = fill_sR+wgmma+
+//   scatter). NO experiment has zeroed fill_sX's GLOBAL LOADS on the
+//   CORRECT fa68162 consumer. This probe is that missing controlled cut:
+//     tps JUMPS   -> the scattered packed-KV gather IS the wall; the next
+//                    lever is a cp.async / TMA bulk gather + prefetch of the
+//                    224 B packed rows (memory main-line), NOT occupancy.
+//     tps NEUTRAL -> the producer is fully exonerated even for its loads;
+//                    the wall is 1-block/SM occupancy + barrier schedule,
+//                    and the memory main-line surgery is skipped.
+//   Comment out for the byte-correct production build.
+#define FMLA_FILL_SX_NULL_PROBE 1
+
 #include "splitkv_mla.h"
 
 #include <cstdio>
@@ -1077,8 +1104,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 for (int e = 0; e < 32; ++e) {
                                     const int t = e * 2 + fx_th;
                                     const uint8_t* pk_row = s_pk_row[t];
+#ifdef FMLA_FILL_SX_NULL_PROBE
+                                    // [step5a] Null the scattered per-token
+                                    //   global byte read to isolate its latency.
+                                    //   Shuffle/decode/store schedule unchanged.
+                                    const uint32_t loaded = 0u;
+                                    (void)pk_row;
+#else
                                     const uint32_t loaded = ((d & 1) == 0 && pk_row != nullptr)
                                         ? (uint32_t)pk_row[byte_off4] : 0u;
+#endif
                                     const uint32_t pair_loaded =
                                         __shfl_xor_sync(0xffffffffu, loaded, 1);
                                     words[e] = ((d & 1) == 0) ? loaded : pair_loaded;
