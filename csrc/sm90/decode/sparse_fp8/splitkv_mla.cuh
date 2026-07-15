@@ -47,7 +47,27 @@
 //   chain (inside flashmla) vs wall+drop_shadow multi-pool schedule
 //   (outside flashmla) -- isolated next by a baseline template-A native
 //   FP8 canary on the identical workload. Probe DISABLED.
-// #define FMLA_PRODUCER_NULL_PROBE 1
+//
+// [Route H step5b] RE-ENABLE the producer-null probe on the CORRECT
+//   fa68162 consumer at the ~944 tps cgon baseline. The step3b result
+//   above is VOID: it was measured on the corrupted d557790 consumer
+//   (19.5 tps floor). On the correct consumer, PROBE2 (step4a) only
+//   removed the R-side (fill_sR+wgmma+scatter) while KEEPING fill_sX
+//   decode, and step5a only nulled fill_sX LOADS while KEEPING the
+//   fill_sX decode instruction海 (shift4/mask/fmaf). NCU_ROOTCAUSE_2606
+//   identified the root cause as bit-unpack INSTRUCTION膨胀 (inst 6.85x,
+//   shared_ld 62.7x) -- NOT the loads. No experiment has ever zeroed the
+//   fill_sX DECODE instructions on the correct consumer. This probe does
+//   exactly that: skips the ENTIRE nope rebuild (unpack decode + affine +
+//   wgmma + staging->sK + producer barriers), keeping only rope-copy +
+//   handshake, so sK nope stays uninitialized (salad). PERF-only.
+//     tps JUMPS   -> the decode instruction膨胀 IS the wall; the next lever
+//                    is producer decode simplification (LUT / warp-coop
+//                    unpack), NOT the 500-line smem occupancy surgery.
+//     tps NEUTRAL -> the producer (incl. decode膨胀) is fully hidden behind
+//                    the 1-block/SM latency wall; occupancy is the only
+//                    remaining lever, justifying the smem-reduction surgery.
+#define FMLA_PRODUCER_NULL_PROBE 1
 
 // [Route H step3k] in-kernel clock64 SEGMENT PROFILE toggle.
 //   When defined, one representative thread per block accumulates clock64()
