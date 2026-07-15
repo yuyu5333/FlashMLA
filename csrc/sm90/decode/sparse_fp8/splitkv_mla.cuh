@@ -180,7 +180,22 @@
 //                    the wall is 1-block/SM occupancy + barrier schedule,
 //                    and the memory main-line surgery is skipped.
 //   Comment out for the byte-correct production build.
-#define FMLA_FILL_SX_NULL_PROBE 1
+// [Route H step5a RESULT] Probe measured bu4 cgon decode tps = 940.21
+//   (TPOT 27.95ms), vs step4d byte-correct baseline 944.72 (TPOT 27.14ms):
+//   -0.48% = NEUTRAL, within run noise. Zeroing the fill_sX scattered
+//   packed-KV global byte loads on the CORRECT fa68162 consumer gave ZERO
+//   tps gain. This closes the last producer hypothesis: the ~231K cyc/block
+//   scattered gather (step3v) is FULLY HIDDEN behind the 1-block/SM latency
+//   wall -- the consumer idles waiting on the buffer handshake regardless of
+//   how fast the loads complete. The producer is now exonerated across FOUR
+//   independent negative cuts (step2a wgmma-skip, step3b full-rebuild-null,
+//   step4a/PROBE2 R-side-remove, step5a load-null). The wall is NOT the
+//   memory main-line; a cp.async/TMA bulk gather buys nothing. The ONLY
+//   remaining lever is OCCUPANCY: get >1 block/SM co-resident (currently
+//   smem-blocked at SmemPlan 225KB > 116KB needed for 2 blocks under the
+//   232KB dyn-smem cap) so the idle consumer of block A overlaps the
+//   producer of block B. Probe DISABLED; production is byte-correct.
+// #define FMLA_FILL_SX_NULL_PROBE 1
 
 #include "splitkv_mla.h"
 
