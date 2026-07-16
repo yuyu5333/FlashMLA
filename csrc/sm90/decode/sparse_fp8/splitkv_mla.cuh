@@ -279,6 +279,7 @@
 #include "splitkv_mla.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_fp8.h>
 #include <math_constants.h>
 #include <cutlass/barrier.h>
@@ -2108,7 +2109,8 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     // cudaFuncSetAttribute invalid-argument triage. This prints the actual
     // dynamic smem request and device opt-in cap before the failing call.
     static bool smem_diag_printed = false;
-    if (!smem_diag_printed) {
+    const bool smem_diag_enabled = std::getenv("FMLA_SMEM_DIAG") != nullptr;
+    if (smem_diag_enabled && !smem_diag_printed) {
         smem_diag_printed = true;
         int dev = -1;
         int optin_smem = -1;
