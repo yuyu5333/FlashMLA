@@ -1569,7 +1569,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         }  // end if (bu > 0) inside wgmma_uniform_supported
                     }
 
-                    if (!wgmma_uniform_supported || bu == 0) {
+                    // [c4c128-packed] Compile the legacy scalar path only for
+                    // non-wgmma targets. MODEL1/CLUSTER_SIZE==1 bu4 uses the
+                    // wgmma uniform path above; keeping the bu==0 scalar
+                    // fallback compiled in permanently allocates its
+                    // __shared__ scratch (s_codes/s_x) and pushes total shared
+                    // memory over the H20 launch cap. This bring-up path runs
+                    // with SGLANG_RQ_BIT_UNIFORM=3, so disabling MODEL1 bu==0
+                    // fallback is intentional until it is rewritten without
+                    // static shared memory.
+                    if constexpr (!wgmma_uniform_supported) {
 
                     // [M3.c.4 Stage-5 Bug-3 fix] Per-token full unpack + affine
                     // + R@x dequant, with **unified barrier sequence** for both
@@ -1826,7 +1835,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     }
 
                     fence_view_async_shared();
-                    }  // end if (!wgmma_uniform_supported || bu == 0) legacy path
+                    }  // end if constexpr (!wgmma_uniform_supported) legacy path
 #else
                     // [Route H step3b] producer null-work: nope reconstruction
                     // skipped entirely; only rope-copy above + handshake below
