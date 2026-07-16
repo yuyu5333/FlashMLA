@@ -87,6 +87,11 @@ def flash_mla_with_kvcache(
     q_nope_is_folded: bool = False,
     identity_tail_bypass: bool = False,
     debug_u32_packed_load: bool = False,
+    # [c4c128-packed] Extra (c4/c128 sink) packed KV byte buffer. When
+    # provided (alongside the SWA packed tensors), c4/c128 extra blocks read
+    # bu4 packed rows + fused dequant using the SHARED calib. None -> extra
+    # blocks stay on the dense FP8 (shadow/native) path (byte-identical).
+    extra_packed_kcache: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -187,6 +192,7 @@ def flash_mla_with_kvcache(
             q_nope_is_folded,
             identity_tail_bypass,
             debug_u32_packed_load,
+            extra_packed_kcache,
         )
     else:
         # Dense attention

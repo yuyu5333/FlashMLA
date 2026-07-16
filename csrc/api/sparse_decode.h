@@ -320,7 +320,14 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &q_for_extra   = std::nullopt,
     bool q_nope_is_folded                          = false,
     bool identity_tail_bypass                      = false,
-    bool debug_u32_packed_load                     = false
+    bool debug_u32_packed_load                     = false,
+    // [c4c128-packed] Extra (c4/c128 sink) packed KV cache byte buffer.
+    // When provided (alongside the six SWA packed tensors), the extra
+    // blocks read packed rows + fused dequant using the SHARED calib
+    // (scale/R/zero/dim_of_bit/bitpos/row_bytes/bit_uniform). Only the
+    // byte buffer + its per-page stride differ from SWA. None -> extra
+    // blocks stay on the dense FP8 (shadow/native) path (byte-identical).
+    const std::optional<at::Tensor> &extra_packed_kcache = std::nullopt
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -745,6 +752,38 @@ sparse_attn_decode_interface(
                 TORCH_CHECK(!identity_tail_bypass || qk_nope_head_dim_val == 448,
                     "identity_tail_bypass expects synthetic DSv4 qk_nope_head_dim=448, got ",
                     qk_nope_head_dim_val);
+            }
+
+            // [c4c128-packed] Wire the extra (c4/c128) packed byte buffer.
+            // It shares the SWA calib validated above; only the byte
+            // buffer + per-page stride differ. Requires extra_kv present
+            // (extra pool active) and same packed_row_bytes as SWA.
+            if (extra_packed_kcache.has_value()) {
+                const at::Tensor &epk = extra_packed_kcache.value();
+                KU_CHECK_DEVICE(epk);
+                TORCH_CHECK(epk.dtype() == at::kByte,
+                    "extra_packed_kcache must be uint8");
+                TORCH_CHECK(epk.stride(-1) == 1,
+                    "extra_packed_kcache must have contiguous last dim");
+                TORCH_CHECK(epk.dim() == 2,
+                    "extra_packed_kcache must be rank-2 [num_rows, row_bytes], got ",
+                    epk.dim());
+                TORCH_CHECK(extra_kv.has_value(),
+                    "extra_packed_kcache requires extra_kv to be present");
+                const auto epk_cols = epk.size(1);
+                TORCH_CHECK(static_cast<int>(epk_cols) == packed_row_bytes_val,
+                    "extra_packed_kcache row_bytes ", epk_cols,
+                    " must equal SWA packed_row_bytes ", packed_row_bytes_val);
+                const auto epk_rows = epk.size(0);
+                const int extra_kv_num_rows =
+                    extra_num_blocks * extra_page_block_size;
+                TORCH_CHECK(static_cast<int64_t>(epk_rows) == extra_kv_num_rows,
+                    "extra_packed_kcache row count ", epk_rows,
+                    " must equal extra_kv num_rows ", extra_kv_num_rows);
+                params.extra_packed_kcache_ptr = epk.data_ptr();
+                params.extra_packed_kv_block_stride =
+                    static_cast<int64_t>(extra_page_block_size) *
+                    static_cast<int64_t>(packed_row_bytes_val);
             }
         }
     }

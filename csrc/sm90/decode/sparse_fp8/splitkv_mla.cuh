@@ -835,10 +835,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // [M3.c.4 Stage-2] Packed-FP8 fused-dequant path.
                 // When packed_kcache_ptr is set, we read packed INT-N rows,
                 // bit-unpack + affine + R@x on the fly, and write BF16 to sK.
-                // Extra KV blocks always use the dense path.
+                // [c4c128-packed] Extra KV blocks (c4/c128 sink) now ALSO
+                // support the packed path when extra_packed_kcache_ptr is set:
+                // they share SWA's calib (R/scale/zero/bit_uniform/row layout),
+                // so only the packed byte buffer + its per-page stride switch.
                 // [DEBUG L2] packed real path re-enabled, setmaxnreg still off
                 const bool use_packed =
-                    !IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr;
+                    (!IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr) ||
+                    (IS_EXTRA_BLOCK && params.extra_packed_kcache_ptr != nullptr);
 
                 if (use_packed) {
                     // ---- Packed FP8 K-load path (S2-S2 fused dequant) ----
@@ -857,7 +861,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int packed_row_bytes = params.packed_row_bytes;
                     const int nope_bytes = packed_row_bytes - 128;  // rope = 64 bf16 = 128 bytes
 
-                    const uint8_t* pk_base = reinterpret_cast<const uint8_t*>(params.packed_kcache_ptr);
+                    // [c4c128-packed] Select the packed byte buffer + per-page
+                    // stride per pool. All other calib pointers are shared.
+                    const uint8_t* pk_base = IS_EXTRA_BLOCK
+                        ? reinterpret_cast<const uint8_t*>(params.extra_packed_kcache_ptr)
+                        : reinterpret_cast<const uint8_t*>(params.packed_kcache_ptr);
                     const float* sk_base = params.scale_kcache_ptr;
                     const float* R_base = params.R_matrix_ptr;
                     // [step3r] BF16-prestored R for the uniform-bit fill_sR
@@ -868,7 +876,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const float* zp_base = params.zero_point_ptr;
                     const int* dob_base = params.dim_of_bit_ptr;
                     const int* bpd_base = params.bitpos_in_dim_ptr;
-                    const int64_t pk_block_stride = params.packed_kv_block_stride;
+                    const int64_t pk_block_stride = IS_EXTRA_BLOCK
+                        ? params.extra_packed_kv_block_stride
+                        : params.packed_kv_block_stride;
 
                     bf16* staging = plan.packed_nope_staging;
 
@@ -2026,7 +2036,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         // Native FP8 path (packed_kcache_ptr == nullptr) still enforces 584.
         if (params.packed_kcache_ptr == nullptr) {
             KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
-            if (params.extra_kv != nullptr) {
+            if (params.extra_kv != nullptr && params.extra_packed_kcache_ptr == nullptr) {
                 KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
             }
         }

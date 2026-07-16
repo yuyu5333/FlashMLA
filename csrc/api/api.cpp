@@ -43,7 +43,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q_for_extra")    = py::none(),
           py::arg("q_nope_is_folded") = false,
           py::arg("identity_tail_bypass") = false,
-          py::arg("debug_u32_packed_load") = false);
+          py::arg("debug_u32_packed_load") = false,
+          // [c4c128-packed] extra (c4/c128 sink) packed KV byte buffer.
+          py::arg("extra_packed_kcache") = py::none());
     m.def("dense_decode_fwd", &dense_attn_decode_interface);
     m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);

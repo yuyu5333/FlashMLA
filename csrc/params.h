@@ -153,6 +153,20 @@ struct SparseAttnDecodeParams {
     int                 qk_nope_head_dim      = 0;
     int                 row_bits              = 0;
 
+    // [c4c128-packed] Extra (c4/c128 sink) packed KV cache pointer + block
+    // stride. c4/c128 share the SAME calib cfg as SWA (build_synthetic_
+    // dsv4_calibration builds one R/scale/zero/bit_uniform for all layers),
+    // so scale_kcache_ptr / R_matrix(_bf16)_ptr / zero_point_ptr /
+    // dim_of_bit_ptr / bitpos_in_dim_ptr / packed_row_bytes / row_bits /
+    // qk_nope_head_dim / bit_uniform are REUSED verbatim. Only the packed
+    // byte buffer and its per-page stride differ per pool. When
+    // extra_packed_kcache_ptr is non-null the IS_EXTRA_BLOCK branch reads
+    // packed rows (bit-unpack + R@x fused dequant) instead of the dense
+    // FP8 shadow path. Default nullptr keeps the pre-existing dense extra
+    // path byte-identical.
+    void*  __restrict__ extra_packed_kcache_ptr = nullptr;
+    int64_t             extra_packed_kv_block_stride = 0;
+
     // ------------------------------------------------------------------
     // [M3.c.4 Stage-5 Route G step 5] uniform-bit layout switch.
     //
