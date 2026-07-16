@@ -2095,6 +2095,27 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    // [c4c128-packed debug] One-shot host-side launch diagnostics for H20
+    // cudaFuncSetAttribute invalid-argument triage. This prints the actual
+    // dynamic smem request and device opt-in cap before the failing call.
+    static bool smem_diag_printed = false;
+    if (!smem_diag_printed) {
+        smem_diag_printed = true;
+        int dev = -1;
+        int optin_smem = -1;
+        int smem_per_sm = -1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(
+            &optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cudaDeviceGetAttribute(
+            &smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+        fprintf(
+            stderr,
+            "[FMLA_SMEM_DIAG] model=%d heads=%d cluster=%d smem_size=%zu "
+            "optin=%d smem_per_sm=%d dev=%d\n",
+            static_cast<int>(MODEL_TYPE), NUM_HEADS, CLUSTER_SIZE, smem_size,
+            optin_smem, smem_per_sm, dev);
+    }
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     // NOTE Don't use PDL because of potential compiler bugs!
