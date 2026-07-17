@@ -118,23 +118,15 @@ struct SharedMemoryPlan {
     //     A operand). After the last wgmma retires, the same 8KB is
     //     overwritten with the bf16(rC) output (per-thread fragment scatter)
     //     so the existing staging->sK copy path stays byte-identical.
-    union {
-        struct {
-            CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 64];
+    CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 64];
 
-            // [M3.c.4 Stage-5 Route G step 4+5] wgmma R matrix K-tile in smem.
-            //
-            // packed_r_tile: [64 dims_out, 64 dims_in] bf16 K-major
-            // (SmemLayoutKTile). Loaded from R_base per (dim_block, K-tile).
-            CUTE_ALIGNAS(128) array_aligned<
-                bf16,
-                cosize_v<SmemLayoutKTile>> packed_r_tile;
-        };
-
-        // build_hadamard(448) uses an H256 prefix. The fast inverse path
-        // reuses the same 16KB as one FP32 [64 tokens, 64 dims] FHT tile.
-        CUTE_ALIGNAS(128) float packed_hadamard_tile[64 * 64];
-    };
+    // [M3.c.4 Stage-5 Route G step 4+5] wgmma R matrix K-tile in smem.
+    //
+    // The fast H256 inverse reinterprets this field together with the
+    // immediately preceding 8KB staging field as one 16KB FP32 tile.
+    CUTE_ALIGNAS(128) array_aligned<
+        bf16,
+        cosize_v<SmemLayoutKTile>> packed_r_tile;
 };
 
 template<

@@ -1390,7 +1390,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         };
 
                         auto run_hadamard64_output = [&](int out_block) {
-                            float* htile = plan.packed_hadamard_tile;
+                            float* htile = reinterpret_cast<float*>(
+                                plan.packed_nope_staging);
                             const int t = idx_in_warpgroup >> 1;
                             const int d_base =
                                 (idx_in_warpgroup & 1) * 32;
