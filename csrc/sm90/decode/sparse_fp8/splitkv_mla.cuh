@@ -860,12 +860,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     const int qk_nope = params.qk_nope_head_dim;
                     const int row_bits = params.row_bits;
                     const int packed_row_bytes = params.packed_row_bytes;
-                    const int packed_code_bytes = (row_bits + 7) >> 3;
-                    const int packed_payload_bytes =
-                        packed_code_bytes +
-                        (params.bit_uniform > 0
-                             ? params.uniform_header_bytes
-                             : 0);
+                    const int nope_bytes = packed_row_bytes - 128;  // rope = 64 bf16 = 128 bytes
 
                     // [c4c128-packed] Select the packed byte buffer + per-page
                     // stride per pool. All other calib pointers are shared.
@@ -926,9 +921,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             const uint8_t* pk_row = pk_base
                                 + block_index * pk_block_stride
                                 + rel_idx_in_block * packed_row_bytes;
-                            const bf16* rope_bf16 =
-                                reinterpret_cast<const bf16*>(
-                                    pk_row + packed_payload_bytes);
+                            const bf16* rope_bf16 = reinterpret_cast<const bf16*>(pk_row + nope_bytes);
 
                             CUTE_UNROLL
                             for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
@@ -1120,8 +1113,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const uint8_t* pk_row = s_pk_row[t];
                                 __half2 hdr = __half2(__float2half(0.0f), __float2half(0.0f));
                                 if (pk_row != nullptr) {
-                                    const int hdr_delta =
-                                        packed_code_bytes + g * 4;
+                                    const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
                                     const __half* hdr_h = reinterpret_cast<const __half*>(
                                         pk_row + hdr_delta
                                     );
@@ -1158,16 +1150,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 uint32_t packed_words[4] = {};
                                 if (pk_row != nullptr) {
                                     const int byte_base = (k_base + d_base) >> 1;
-                                    const uint8_t* load_ptr =
-                                        pk_row + byte_base;
-                                    asm volatile(
-                                        "ld.global.v4.u32 "
-                                        "{%0,%1,%2,%3}, [%4];"
-                                        : "=r"(packed_words[0]),
-                                          "=r"(packed_words[1]),
-                                          "=r"(packed_words[2]),
-                                          "=r"(packed_words[3])
-                                        : "l"(load_ptr));
+                                    CUTE_UNROLL
+                                    for (int w = 0; w < 4; ++w) {
+                                        packed_words[w] = __ldg(
+                                            reinterpret_cast<const uint32_t*>(
+                                                pk_row + byte_base + w * 4));
+                                    }
                                 }
 
                                 const int hdr_base =
@@ -1772,7 +1760,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 // s_hdr across the 128 producer-WG threads).
                                 const uint8_t* hdr_base = invalid
                                     ? nullptr
-                                    : (pk_row + packed_code_bytes);
+                                    : (pk_row + nope_bytes - u_hdr_bytes);
 
                                 if (!invalid) {
                                     for (int d = idx_in_warpgroup; d < qk_nope; d += 128) {
