@@ -1470,12 +1470,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 bf16* prefix_sK =
                                     plan.u.k[buf_idx].data() + t * 8 +
                                     prefix_group * 16 * TOPK_BLOCK_SIZE;
-                                *reinterpret_cast<__int128_t*>(
-                                    prefix_sK +
-                                    prefix_half * TOPK_BLOCK_SIZE) =
-                                    *reinterpret_cast<__int128_t*>(
-                                        &prefix_out);
 
+                                bf16x8 tail_out;
                                 if (lane < 24) {
                                     const int tail_dim = 256 + lane * 8;
                                     uint32_t tail_word = 0;
@@ -1494,7 +1490,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         __half2float(__low2half(tail_hdr));
                                     const float tail_step =
                                         __half2float(__high2half(tail_hdr));
-                                    bf16x8 tail_out;
                                     bf16* tail_elem =
                                         reinterpret_cast<bf16*>(&tail_out);
                                     CUTE_UNROLL
@@ -1510,16 +1505,42 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                             : 0.0f;
                                         tail_elem[j] = bf16(x_val);
                                     }
-                                    const int tail_group = tail_dim >> 4;
-                                    const int tail_half = tail_dim & 8;
-                                    bf16* tail_sK =
-                                        plan.u.k[buf_idx].data() + t * 8 +
-                                        tail_group * 16 * TOPK_BLOCK_SIZE;
-                                    *reinterpret_cast<__int128_t*>(
-                                        tail_sK +
-                                        tail_half * TOPK_BLOCK_SIZE) =
+                                }
+
+                                // Keep the logical K layout unchanged, but issue
+                                // 128-bit stores in two lane phases to reduce
+                                // same-cycle conflicts in the interleaved layout.
+                                CUTE_UNROLL
+                                for (int store_phase = 0;
+                                     store_phase < 2; ++store_phase) {
+                                    if ((lane >> 4) == store_phase) {
                                         *reinterpret_cast<__int128_t*>(
-                                            &tail_out);
+                                            prefix_sK +
+                                            prefix_half *
+                                                TOPK_BLOCK_SIZE) =
+                                            *reinterpret_cast<__int128_t*>(
+                                                &prefix_out);
+                                    }
+                                    if (lane < 24 &&
+                                        (lane >> 4) == store_phase) {
+                                        const int tail_dim =
+                                            256 + lane * 8;
+                                        const int tail_group =
+                                            tail_dim >> 4;
+                                        const int tail_half =
+                                            tail_dim & 8;
+                                        bf16* tail_sK =
+                                            plan.u.k[buf_idx].data() +
+                                            t * 8 +
+                                            tail_group * 16 *
+                                                TOPK_BLOCK_SIZE;
+                                        *reinterpret_cast<__int128_t*>(
+                                            tail_sK +
+                                            tail_half *
+                                                TOPK_BLOCK_SIZE) =
+                                            *reinterpret_cast<__int128_t*>(
+                                                &tail_out);
+                                    }
                                 }
                             }
                             cutlass::arch::fence_view_async_shared();
