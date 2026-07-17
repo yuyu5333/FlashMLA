@@ -1,0 +1,21 @@
+csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
+  s_fad3c8cbeaadcf::t_23d95f4c6e0d1b 1392-1530,1711-1716,1783
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e71a97c33245029eb2ae84f128872ec5090fb59f",
+  "prompts": {},
+  "sessions": {
+    "s_fad3c8cbeaadcf": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a58b9f3e127d6363e6fe2e6",
+        "model": "gpt-5.4__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
