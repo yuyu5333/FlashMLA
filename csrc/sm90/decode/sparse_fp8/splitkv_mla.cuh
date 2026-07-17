@@ -1164,30 +1164,47 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 const float fmin = __half2float(__low2half(hdr));
                                 const float fstep = __half2float(__high2half(hdr));
                                 CUTE_UNROLL
-                                for (int i = 0; i < 32; ++i) {
-                                    const int d = d_base + i;
-                                    const int code = static_cast<int>(
-                                        (packed_words[i >> 3] >> ((i & 7) * 4)) &
-                                        0xFu);
-                                    const float x_val =
-                                        pk_row != nullptr
-                                        ? fmaf(static_cast<float>(code), fstep, fmin)
-                                        : 0.0f;
+                                for (int w = 0; w < 4; ++w) {
+                                    bf16x8 decoded;
+                                    bf16* decoded_elem =
+                                        reinterpret_cast<bf16*>(&decoded);
+                                    CUTE_UNROLL
+                                    for (int j = 0; j < 8; ++j) {
+                                        const int code = static_cast<int>(
+                                            (packed_words[w] >> (j * 4)) & 0xFu);
+                                        const float x_val =
+                                            pk_row != nullptr
+                                            ? fmaf(
+                                                  static_cast<float>(code),
+                                                  fstep,
+                                                  fmin)
+                                            : 0.0f;
+                                        decoded_elem[j] = bf16(x_val);
+                                    }
+
+                                    const int d = d_base + w * 8;
                                     if (direct_sK) {
                                         const int dim_group = d >> 4;
                                         const int dim_half = d & 8;
-                                        const int dim_sub = d & 7;
                                         bf16* sK_nope_base =
                                             plan.u.k[buf_idx].data() + t * 8 +
                                             dim_group * 16 * TOPK_BLOCK_SIZE;
-                                        sK_nope_base
-                                            [(k_base + dim_half) *
-                                                 TOPK_BLOCK_SIZE +
-                                             dim_sub] = bf16(x_val);
+                                        *reinterpret_cast<__int128_t*>(
+                                            sK_nope_base +
+                                            (k_base + dim_half) *
+                                                TOPK_BLOCK_SIZE) =
+                                            *reinterpret_cast<__int128_t*>(
+                                                &decoded);
                                     } else if (direct_staging) {
-                                        staging[t * 64 + d] = bf16(x_val);
+                                        *reinterpret_cast<__int128_t*>(
+                                            staging + t * 64 + d) =
+                                            *reinterpret_cast<__int128_t*>(
+                                                &decoded);
                                     } else {
-                                        sX_tile(t, d) = bf16(x_val);
+                                        *reinterpret_cast<__int128_t*>(
+                                            &sX_tile(t, d)) =
+                                            *reinterpret_cast<__int128_t*>(
+                                                &decoded);
                                     }
                                 }
                                 return;
