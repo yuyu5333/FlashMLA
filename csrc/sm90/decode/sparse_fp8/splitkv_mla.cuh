@@ -1389,6 +1389,145 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         };
 
+                        auto run_warp_hadamard256 = [&]() {
+                            const int warp = idx_in_warpgroup >> 5;
+                            const int lane = idx_in_warpgroup & 31;
+                            CUTE_UNROLL
+                            for (int round = 0; round < 16; ++round) {
+                                const int t = warp * 16 + round;
+                                const uint8_t* pk_row = s_pk_row[t];
+                                uint32_t word = 0;
+                                if (pk_row != nullptr) {
+                                    word = __ldg(
+                                        reinterpret_cast<const uint32_t*>(
+                                            pk_row + lane * 4));
+                                }
+                                const int group = lane >> 3;
+                                const __half2 hdr =
+                                    s_hdr[group * TOPK_BLOCK_SIZE + t];
+                                const float fmin =
+                                    __half2float(__low2half(hdr));
+                                const float fstep =
+                                    __half2float(__high2half(hdr));
+
+                                float values[8];
+                                CUTE_UNROLL
+                                for (int j = 0; j < 8; ++j) {
+                                    const int code = static_cast<int>(
+                                        (word >> (j * 4)) & 0xFu);
+                                    const float x_val =
+                                        pk_row != nullptr
+                                        ? fmaf(
+                                              static_cast<float>(code),
+                                              fstep,
+                                              fmin)
+                                        : 0.0f;
+                                    values[j] =
+                                        static_cast<float>(bf16(x_val));
+                                }
+
+                                CUTE_UNROLL
+                                for (int span = 1; span < 8; span <<= 1) {
+                                    CUTE_UNROLL
+                                    for (int base = 0; base < 8;
+                                         base += span << 1) {
+                                        CUTE_UNROLL
+                                        for (int j = 0; j < span; ++j) {
+                                            const float a = values[base + j];
+                                            const float b =
+                                                values[base + span + j];
+                                            values[base + j] = a + b;
+                                            values[base + span + j] = a - b;
+                                        }
+                                    }
+                                }
+                                CUTE_UNROLL
+                                for (int mask = 1; mask < 32; mask <<= 1) {
+                                    CUTE_UNROLL
+                                    for (int j = 0; j < 8; ++j) {
+                                        const float other =
+                                            __shfl_xor_sync(
+                                                0xffffffffu,
+                                                values[j],
+                                                mask);
+                                        values[j] = (lane & mask)
+                                            ? other - values[j]
+                                            : values[j] + other;
+                                    }
+                                }
+
+                                bf16x8 prefix_out;
+                                bf16* prefix_elem =
+                                    reinterpret_cast<bf16*>(&prefix_out);
+                                CUTE_UNROLL
+                                for (int j = 0; j < 8; ++j) {
+                                    prefix_elem[j] =
+                                        bf16(values[j] * 0.0625f);
+                                }
+                                const int prefix_dim = lane * 8;
+                                const int prefix_group = prefix_dim >> 4;
+                                const int prefix_half = prefix_dim & 8;
+                                bf16* prefix_sK =
+                                    plan.u.k[buf_idx].data() + t * 8 +
+                                    prefix_group * 16 * TOPK_BLOCK_SIZE;
+                                *reinterpret_cast<__int128_t*>(
+                                    prefix_sK +
+                                    prefix_half * TOPK_BLOCK_SIZE) =
+                                    *reinterpret_cast<__int128_t*>(
+                                        &prefix_out);
+
+                                if (lane < 24) {
+                                    const int tail_dim = 256 + lane * 8;
+                                    uint32_t tail_word = 0;
+                                    if (pk_row != nullptr) {
+                                        tail_word = __ldg(
+                                            reinterpret_cast<const uint32_t*>(
+                                                pk_row + (tail_dim >> 1)));
+                                    }
+                                    const int tail_hdr_group = tail_dim >> 6;
+                                    const __half2 tail_hdr =
+                                        s_hdr[
+                                            tail_hdr_group *
+                                                TOPK_BLOCK_SIZE +
+                                            t];
+                                    const float tail_min =
+                                        __half2float(__low2half(tail_hdr));
+                                    const float tail_step =
+                                        __half2float(__high2half(tail_hdr));
+                                    bf16x8 tail_out;
+                                    bf16* tail_elem =
+                                        reinterpret_cast<bf16*>(&tail_out);
+                                    CUTE_UNROLL
+                                    for (int j = 0; j < 8; ++j) {
+                                        const int code = static_cast<int>(
+                                            (tail_word >> (j * 4)) & 0xFu);
+                                        const float x_val =
+                                            pk_row != nullptr
+                                            ? fmaf(
+                                                  static_cast<float>(code),
+                                                  tail_step,
+                                                  tail_min)
+                                            : 0.0f;
+                                        tail_elem[j] = bf16(x_val);
+                                    }
+                                    const int tail_group = tail_dim >> 4;
+                                    const int tail_half = tail_dim & 8;
+                                    bf16* tail_sK =
+                                        plan.u.k[buf_idx].data() + t * 8 +
+                                        tail_group * 16 * TOPK_BLOCK_SIZE;
+                                    *reinterpret_cast<__int128_t*>(
+                                        tail_sK +
+                                        tail_half * TOPK_BLOCK_SIZE) =
+                                        *reinterpret_cast<__int128_t*>(
+                                            &tail_out);
+                                }
+                            }
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(
+                                128,
+                                NamedBarriers::packed_kv_producer_sync);
+                        };
+
                         // [step3o] Same hoist + strength-reduction for fill_sR.
                         //   d is a per-thread constant; j advances by 2 per e, so
                         //   the R address advances by a constant 2*qk_nope stride
@@ -1569,8 +1708,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             write_staging_tile_to_sK(k_base);
                         }
 #else
-                        CUTE_NO_UNROLL
-                        for (int grp0 = 0; grp0 < DIM_BLOCKS; grp0 += RC_GROUP) {
+                        if (params.identity_tail_bypass && bu == 4) {
+                            run_warp_hadamard256();
+                        } else {
+                            CUTE_NO_UNROLL
+                            for (int grp0 = 0; grp0 < DIM_BLOCKS;
+                                 grp0 += RC_GROUP) {
                             const int rem = DIM_BLOCKS - grp0;
                             const int G = rem < RC_GROUP ? rem : RC_GROUP;
                             if (params.identity_tail_bypass && grp0 >= 4) {
@@ -1637,6 +1780,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             unsigned long long _clk_s5 = clock64();
                             if (idx_in_warpgroup == 0) fmla_clk_add(10, _clk_s5 - _clk_s4);
 #endif
+                            }
                         }
 #endif  // FMLA_FOLD_ROT_PROBE2
 
