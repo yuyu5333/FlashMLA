@@ -1138,6 +1138,61 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         const int fx_d = idx_in_warpgroup & 63;
                         const int fx_th = idx_in_warpgroup >> 6;   // 0 or 1
                         auto fill_sX_tile = [&](int k_base, bool direct_staging = false, bool direct_sK = false) {
+#if !defined(FMLA_ENABLE_U32_LOAD_ORACLE)
+                            if (bu == 4) {
+                                // Map two producer threads to each token. Each
+                                // thread decodes one contiguous 32-dim half-row
+                                // from four aligned u32 loads instead of issuing
+                                // 32 scattered byte loads across different rows.
+                                const int t = idx_in_warpgroup >> 1;
+                                const int d_base = (idx_in_warpgroup & 1) * 32;
+                                const uint8_t* pk_row = s_pk_row[t];
+                                uint32_t packed_words[4] = {};
+                                if (pk_row != nullptr) {
+                                    const int byte_base = (k_base + d_base) >> 1;
+                                    CUTE_UNROLL
+                                    for (int w = 0; w < 4; ++w) {
+                                        packed_words[w] = __ldg(
+                                            reinterpret_cast<const uint32_t*>(
+                                                pk_row + byte_base + w * 4));
+                                    }
+                                }
+
+                                const int hdr_base =
+                                    (k_base / u_group_size) * TOPK_BLOCK_SIZE;
+                                const __half2 hdr = s_hdr[hdr_base + t];
+                                const float fmin = __half2float(__low2half(hdr));
+                                const float fstep = __half2float(__high2half(hdr));
+                                CUTE_UNROLL
+                                for (int i = 0; i < 32; ++i) {
+                                    const int d = d_base + i;
+                                    const int code = static_cast<int>(
+                                        (packed_words[i >> 3] >> ((i & 7) * 4)) &
+                                        0xFu);
+                                    const float x_val =
+                                        pk_row != nullptr
+                                        ? fmaf(static_cast<float>(code), fstep, fmin)
+                                        : 0.0f;
+                                    if (direct_sK) {
+                                        const int dim_group = d >> 4;
+                                        const int dim_half = d & 8;
+                                        const int dim_sub = d & 7;
+                                        bf16* sK_nope_base =
+                                            plan.u.k[buf_idx].data() + t * 8 +
+                                            dim_group * 16 * TOPK_BLOCK_SIZE;
+                                        sK_nope_base
+                                            [(k_base + dim_half) *
+                                                 TOPK_BLOCK_SIZE +
+                                             dim_sub] = bf16(x_val);
+                                    } else if (direct_staging) {
+                                        staging[t * 64 + d] = bf16(x_val);
+                                    } else {
+                                        sX_tile(t, d) = bf16(x_val);
+                                    }
+                                }
+                                return;
+                            }
+#endif
                             const int d = fx_d;
                             const int d_global = k_base + d;
                             const int bit_off_global = d_global * bu;
