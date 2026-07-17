@@ -1389,6 +1389,118 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         };
 
+                        auto run_hadamard64_output = [&](int out_block) {
+                            float* htile = plan.packed_hadamard_tile;
+                            const int t = idx_in_warpgroup >> 1;
+                            const int d_base =
+                                (idx_in_warpgroup & 1) * 32;
+                            const uint8_t* pk_row = s_pk_row[t];
+
+                            CUTE_UNROLL
+                            for (int w = 0; w < 4; ++w) {
+                                float accum[8] = {};
+                                CUTE_UNROLL
+                                for (int src_block = 0; src_block < 4;
+                                     ++src_block) {
+                                    uint32_t word = 0;
+                                    if (pk_row != nullptr) {
+                                        const int byte_off =
+                                            src_block * 32 +
+                                            (d_base >> 1) + w * 4;
+                                        word = __ldg(
+                                            reinterpret_cast<const uint32_t*>(
+                                                pk_row + byte_off));
+                                    }
+                                    const __half2 hdr =
+                                        s_hdr[src_block * TOPK_BLOCK_SIZE + t];
+                                    const float fmin =
+                                        __half2float(__low2half(hdr));
+                                    const float fstep =
+                                        __half2float(__high2half(hdr));
+                                    const float sign =
+                                        (__popc(src_block & out_block) & 1)
+                                        ? -1.0f
+                                        : 1.0f;
+                                    CUTE_UNROLL
+                                    for (int j = 0; j < 8; ++j) {
+                                        const int code =
+                                            static_cast<int>(
+                                                (word >> (j * 4)) & 0xFu);
+                                        const float x_val =
+                                            pk_row != nullptr
+                                            ? fmaf(
+                                                  static_cast<float>(code),
+                                                  fstep,
+                                                  fmin)
+                                            : 0.0f;
+                                        // Match the BF16 WGMMA input boundary.
+                                        accum[j] += sign *
+                                            static_cast<float>(bf16(x_val));
+                                    }
+                                }
+                                CUTE_UNROLL
+                                for (int j = 0; j < 8; ++j) {
+                                    htile[t * 64 + d_base + w * 8 + j] =
+                                        accum[j];
+                                }
+                            }
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(
+                                128,
+                                NamedBarriers::packed_kv_producer_sync);
+
+                            CUTE_UNROLL
+                            for (int span = 1; span < 64; span <<= 1) {
+                                CUTE_UNROLL
+                                for (int idx = idx_in_warpgroup; idx < 2048;
+                                     idx += 128) {
+                                    const int token = idx >> 5;
+                                    const int pair = idx & 31;
+                                    const int group = pair / span;
+                                    const int lane = pair - group * span;
+                                    const int a =
+                                        token * 64 + group * (span << 1) +
+                                        lane;
+                                    const int b = a + span;
+                                    const float va = htile[a];
+                                    const float vb = htile[b];
+                                    htile[a] = va + vb;
+                                    htile[b] = va - vb;
+                                }
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(
+                                    128,
+                                    NamedBarriers::packed_kv_producer_sync);
+                            }
+
+                            CUTE_UNROLL
+                            for (int w = 0; w < 4; ++w) {
+                                const int d = d_base + w * 8;
+                                bf16x8 out;
+                                bf16* out_elem =
+                                    reinterpret_cast<bf16*>(&out);
+                                CUTE_UNROLL
+                                for (int j = 0; j < 8; ++j) {
+                                    out_elem[j] = bf16(
+                                        htile[t * 64 + d + j] * 0.0625f);
+                                }
+                                const int dim_group = d >> 4;
+                                const int dim_half = d & 8;
+                                bf16* sK_nope_base =
+                                    plan.u.k[buf_idx].data() + t * 8 +
+                                    dim_group * 16 * TOPK_BLOCK_SIZE;
+                                *reinterpret_cast<__int128_t*>(
+                                    sK_nope_base +
+                                    (out_block * 64 + dim_half) *
+                                        TOPK_BLOCK_SIZE) =
+                                    *reinterpret_cast<__int128_t*>(&out);
+                            }
+                            cutlass::arch::fence_view_async_shared();
+                            NamedBarrier::sync(
+                                128,
+                                NamedBarriers::packed_kv_producer_sync);
+                        };
+
                         // [step3o] Same hoist + strength-reduction for fill_sR.
                         //   d is a per-thread constant; j advances by 2 per e, so
                         //   the R address advances by a constant 2*qk_nope stride
@@ -1569,8 +1681,24 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             write_staging_tile_to_sK(k_base);
                         }
 #else
-                        CUTE_NO_UNROLL
-                        for (int grp0 = 0; grp0 < DIM_BLOCKS; grp0 += RC_GROUP) {
+                        if (params.identity_tail_bypass && bu == 4) {
+                            CUTE_UNROLL
+                            for (int out_block = 0; out_block < 4;
+                                 ++out_block) {
+                                run_hadamard64_output(out_block);
+                            }
+                            CUTE_UNROLL
+                            for (int kt = 4; kt < DIM_BLOCKS; ++kt) {
+                                fill_sX_tile(kt * 64, false, true);
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(
+                                    128,
+                                    NamedBarriers::packed_kv_producer_sync);
+                            }
+                        } else {
+                            CUTE_NO_UNROLL
+                            for (int grp0 = 0; grp0 < DIM_BLOCKS;
+                                 grp0 += RC_GROUP) {
                             const int rem = DIM_BLOCKS - grp0;
                             const int G = rem < RC_GROUP ? rem : RC_GROUP;
                             if (params.identity_tail_bypass && grp0 >= 4) {
@@ -1637,6 +1765,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             unsigned long long _clk_s5 = clock64();
                             if (idx_in_warpgroup == 0) fmla_clk_add(10, _clk_s5 - _clk_s4);
 #endif
+                            }
                         }
 #endif  // FMLA_FOLD_ROT_PROBE2
 

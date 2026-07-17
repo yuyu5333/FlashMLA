@@ -118,29 +118,23 @@ struct SharedMemoryPlan {
     //     A operand). After the last wgmma retires, the same 8KB is
     //     overwritten with the bf16(rC) output (per-thread fragment scatter)
     //     so the existing staging->sK copy path stays byte-identical.
-    CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 64];
+    union {
+        struct {
+            CUTE_ALIGNAS(128) bf16 packed_nope_staging[64 * 64];
 
-    // [M3.c.4 Stage-5 Route G step 4+5] wgmma R matrix K-tile in smem.
-    //
-    // packed_r_tile: [64 dims_out, 64 dims_in] bf16 K-major (SmemLayoutKTile).
-    //   Loaded from R_base per (dim_block, K-tile). Consumed by wgmma as B
-    //   in MMA_64x64x16_F32BF16BF16_SS<K, K>.
-    //
-    // [step3k smem-fit revert] The Route G step8/9 producer double-buffers
-    //   (packed_x_alt_tile + packed_r_alt_tile, +16 KB) were REMOVED. Reason:
-    //   (1) MODEL1 SharedMemoryPlan with both alt tiles = 241664 B, which
-    //       exceeds the H20 SM90 opt-in dyn-smem cap of 232448 B, so the
-    //       kernel could not even launch (cudaFuncSetAttribute -> invalid
-    //       argument). The stale Jun-30 binary masked this; the current
-    //       source never actually ran.
-    //   (2) Route H step2a/3b independently PROVED the packed producer is NOT
-    //       the decode bottleneck (zeroing the entire producer nope rebuild
-    //       gave 0 tps change), so the producer wgmma-pipeline overlap those
-    //       alt tiles enabled is a dead speculative optimization.
-    //   The producer loop is reverted to a byte-correct single-buffer
-    //   dim-block-by-1 schedule that reuses only packed_nope_staging (sX +
-    //   staging) and packed_r_tile (sR). New MODEL1 plan = 225280 B (fits).
-    CUTE_ALIGNAS(128) array_aligned<bf16, cosize_v<SmemLayoutKTile>> packed_r_tile;
+            // [M3.c.4 Stage-5 Route G step 4+5] wgmma R matrix K-tile in smem.
+            //
+            // packed_r_tile: [64 dims_out, 64 dims_in] bf16 K-major
+            // (SmemLayoutKTile). Loaded from R_base per (dim_block, K-tile).
+            CUTE_ALIGNAS(128) array_aligned<
+                bf16,
+                cosize_v<SmemLayoutKTile>> packed_r_tile;
+        };
+
+        // build_hadamard(448) uses an H256 prefix. The fast inverse path
+        // reuses the same 16KB as one FP32 [64 tokens, 64 dims] FHT tile.
+        CUTE_ALIGNAS(128) float packed_hadamard_tile[64 * 64];
+    };
 };
 
 template<
