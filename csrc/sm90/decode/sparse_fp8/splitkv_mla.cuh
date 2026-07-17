@@ -1102,34 +1102,30 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   Invalid tokens (s_pk_row[t]==nullptr) store {0,0};
                         //   the loop still gates on s_pk_row[t].
                         __shared__ __half2 s_hdr[(HEAD_DIM_NOPE / 64) * TOPK_BLOCK_SIZE];
-                        if constexpr (!PACKED_BU4) {
-                            {
-                                const int n_groups = k_tiles;   // == HEAD_DIM_NOPE/64
-                                const float inv_denom = 1.0f / u_step_denom;
-                                for (int idx = idx_in_warpgroup;
-                                     idx < n_groups * TOPK_BLOCK_SIZE;
-                                     idx += 128) {
-                                    const int t = idx & (TOPK_BLOCK_SIZE - 1);
-                                    const int g = idx / TOPK_BLOCK_SIZE;
-                                    const uint8_t* pk_row = s_pk_row[t];
-                                    __half2 hdr = __half2(__float2half(0.0f), __float2half(0.0f));
-                                    if (pk_row != nullptr) {
-                                        const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
-                                        const __half* hdr_h = reinterpret_cast<const __half*>(
-                                            pk_row + hdr_delta
-                                        );
-                                        const float fmin = __half2float(hdr_h[0]);
-                                        const float frange = __half2float(hdr_h[1]);
-                                        const float fstep = frange * inv_denom;
-                                        hdr = __half2(__float2half(fmin), __float2half(fstep));
-                                    }
-                                    s_hdr[idx] = hdr;
+                        {
+                            const int n_groups = k_tiles;   // == HEAD_DIM_NOPE/64
+                            const float inv_denom = 1.0f / u_step_denom;
+                            for (int idx = idx_in_warpgroup;
+                                 idx < n_groups * TOPK_BLOCK_SIZE;
+                                 idx += 128) {
+                                const int t = idx & (TOPK_BLOCK_SIZE - 1);
+                                const int g = idx / TOPK_BLOCK_SIZE;
+                                const uint8_t* pk_row = s_pk_row[t];
+                                __half2 hdr = __half2(__float2half(0.0f), __float2half(0.0f));
+                                if (pk_row != nullptr) {
+                                    const int hdr_delta = nope_bytes - u_hdr_bytes + g * 4;
+                                    const __half* hdr_h = reinterpret_cast<const __half*>(
+                                        pk_row + hdr_delta
+                                    );
+                                    const float fmin = __half2float(hdr_h[0]);
+                                    const float frange = __half2float(hdr_h[1]);
+                                    const float fstep = frange * inv_denom;
+                                    hdr = __half2(__float2half(fmin), __float2half(fstep));
                                 }
+                                s_hdr[idx] = hdr;
                             }
-                            NamedBarrier::sync(
-                                128,
-                                NamedBarriers::packed_kv_producer_sync);
                         }
+                        NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
 
                         // [step3o] Loop-invariant hoist. For a given thread the
                         //   32 elements share the SAME d = lin & 63 (lin =
@@ -1396,40 +1392,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         auto run_warp_hadamard256 = [&]() {
                             const int warp = idx_in_warpgroup >> 5;
                             const int lane = idx_in_warpgroup & 31;
-                            auto load_bu4_header = [&](int t,
-                                                        const uint8_t* pk_row,
-                                                        int group,
-                                                        int leader,
-                                                        float& fmin,
-                                                        float& fstep) {
-                                if constexpr (PACKED_BU4) {
-                                    float leader_min = 0.0f;
-                                    float leader_step = 0.0f;
-                                    if (lane == leader && pk_row != nullptr) {
-                                        const __half* hdr_h =
-                                            reinterpret_cast<const __half*>(
-                                                pk_row + nope_bytes -
-                                                u_hdr_bytes + group * 4);
-                                        leader_min =
-                                            __half2float(hdr_h[0]);
-                                        leader_step =
-                                            __half2float(hdr_h[1]) *
-                                            (1.0f / 15.0f);
-                                    }
-                                    fmin = __shfl_sync(
-                                        0xffffffffu, leader_min, leader);
-                                    fstep = __shfl_sync(
-                                        0xffffffffu, leader_step, leader);
-                                } else {
-                                    const __half2 hdr =
-                                        s_hdr[
-                                            group * TOPK_BLOCK_SIZE + t];
-                                    fmin =
-                                        __half2float(__low2half(hdr));
-                                    fstep =
-                                        __half2float(__high2half(hdr));
-                                }
-                            };
                             CUTE_UNROLL
                             for (int round = 0; round < 16; ++round) {
                                 const int t = warp * 16 + round;
@@ -1440,11 +1402,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         reinterpret_cast<const uint32_t*>(
                                             pk_row + lane * 4));
                                 }
-                                float fmin;
-                                float fstep;
-                                load_bu4_header(
-                                    t, pk_row, lane >> 3, lane & ~7,
-                                    fmin, fstep);
+                                const int group = lane >> 3;
+                                const __half2 hdr =
+                                    s_hdr[group * TOPK_BLOCK_SIZE + t];
+                                const float fmin =
+                                    __half2float(__low2half(hdr));
+                                const float fstep =
+                                    __half2float(__high2half(hdr));
 
                                 float values[8];
                                 CUTE_UNROLL
@@ -1516,11 +1480,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                             reinterpret_cast<const uint32_t*>(
                                                 pk_row + (tail_dim >> 1)));
                                     }
-                                    float tail_min;
-                                    float tail_step;
-                                    load_bu4_header(
-                                        t, pk_row, tail_dim >> 6,
-                                        lane & ~7, tail_min, tail_step);
+                                    const int tail_hdr_group = tail_dim >> 6;
+                                    const __half2 tail_hdr =
+                                        s_hdr[
+                                            tail_hdr_group *
+                                                TOPK_BLOCK_SIZE +
+                                            t];
+                                    const float tail_min =
+                                        __half2float(__low2half(tail_hdr));
+                                    const float tail_step =
+                                        __half2float(__high2half(tail_hdr));
                                     bf16* tail_elem =
                                         reinterpret_cast<bf16*>(&tail_out);
                                     CUTE_UNROLL
