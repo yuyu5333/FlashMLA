@@ -1137,7 +1137,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         //   Byte-identical: same sX_tile(t,d) mapping, same math.
                         const int fx_d = idx_in_warpgroup & 63;
                         const int fx_th = idx_in_warpgroup >> 6;   // 0 or 1
-                        auto fill_sX_tile = [&](int k_base, bool direct_staging = false) {
+                        auto fill_sX_tile = [&](int k_base, bool direct_staging = false, bool direct_sK = false) {
                             const int d = fx_d;
                             const int d_global = k_base + d;
                             const int bit_off_global = d_global * bu;
@@ -1281,7 +1281,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         const float fstep = __half2float(__high2half(hdr));
                                         x_val = fmaf((float)code, fstep, fmin);
                                     }
-                                    if (direct_staging) {
+                                    if (direct_sK) {
+                                        // Identity-tail blocks do not need R@X. Store the
+                                        // decoded scalar directly into the final sK layout
+                                        // and avoid the row-major staging round trip.
+                                        const int dim_group = d >> 4;
+                                        const int dim_half = d & 8;
+                                        const int dim_sub = d & 7;
+                                        bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                            + t * 8 + dim_group * 16 * TOPK_BLOCK_SIZE;
+                                        sK_nope_base[(k_base + dim_half) * TOPK_BLOCK_SIZE + dim_sub] = bf16(x_val);
+                                    } else if (direct_staging) {
                                         staging[t * 64 + d] = bf16(x_val);
                                     } else {
                                         sX_tile(t, d) = bf16(x_val);
@@ -1302,7 +1312,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                         const float fstep = __half2float(__high2half(hdr));
                                         x_val = fmaf((float)code, fstep, fmin);
                                     }
-                                    if (direct_staging) {
+                                    if (direct_sK) {
+                                        // Identity-tail blocks do not need R@X. Store the
+                                        // decoded scalar directly into the final sK layout
+                                        // and avoid the row-major staging round trip.
+                                        const int dim_group = d >> 4;
+                                        const int dim_half = d & 8;
+                                        const int dim_sub = d & 7;
+                                        bf16* sK_nope_base = plan.u.k[buf_idx].data()
+                                            + t * 8 + dim_group * 16 * TOPK_BLOCK_SIZE;
+                                        sK_nope_base[(k_base + dim_half) * TOPK_BLOCK_SIZE + dim_sub] = bf16(x_val);
+                                    } else if (direct_staging) {
                                         // Direct paths do not feed wgmma; keep
                                         // staging row-major so the existing
                                         // staging->sK vector store layout is reused.
@@ -1507,8 +1527,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 // identity tail.
                                 for (int kt = grp0; kt < grp0 + G; ++kt) {
                                     const int k_base = kt * 64;
-                                    fill_sX_tile(k_base, true);
-                                    write_staging_tile_to_sK(k_base);
+                                    fill_sX_tile(k_base, false, true);
+                                    cutlass::arch::fence_view_async_shared();
+                                    NamedBarrier::sync(128, NamedBarriers::packed_kv_producer_sync);
                                 }
                                 continue;
                             }
