@@ -1416,10 +1416,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                             __half2float(hdr_h[1]) *
                                             (1.0f / 15.0f);
                                     }
+                                    const unsigned group_mask =
+                                        0xffu << leader;
                                     fmin = __shfl_sync(
-                                        0xffffffffu, leader_min, leader);
+                                        group_mask, leader_min, leader);
                                     fstep = __shfl_sync(
-                                        0xffffffffu, leader_step, leader);
+                                        group_mask, leader_step, leader);
                                 } else {
                                     const __half2 hdr =
                                         s_hdr[
