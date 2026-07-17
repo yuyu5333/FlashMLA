@@ -310,7 +310,7 @@ static __forceinline__ __device__ void store_o(
 }
 
 
-template<typename TMAParams>
+template<typename TMAParams, bool PACKED_BU4 = false>
 static __device__ __forceinline__ void
 devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params);
 

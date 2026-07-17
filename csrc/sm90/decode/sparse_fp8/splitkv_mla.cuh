@@ -391,7 +391,7 @@ __forceinline__ __device__ void scale_softmax(
 }
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
-template<typename TMAParams>
+template<typename TMAParams, bool PACKED_BU4>
 __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
@@ -841,7 +841,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 // they share SWA's calib (R/scale/zero/bit_uniform/row layout),
                 // so only the packed byte buffer + its per-page stride switch.
                 // [DEBUG L2] packed real path re-enabled, setmaxnreg still off
-                const bool use_packed =
+                const bool use_packed = PACKED_BU4 ||
                     (!IS_EXTRA_BLOCK && params.packed_kcache_ptr != nullptr) ||
                     (IS_EXTRA_BLOCK && params.extra_packed_kcache_ptr != nullptr);
 
@@ -1708,7 +1708,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             write_staging_tile_to_sK(k_base);
                         }
 #else
-                        if (params.identity_tail_bypass && bu == 4) {
+                        if (PACKED_BU4 ||
+                            (params.identity_tail_bypass && bu == 4)) {
                             run_warp_hadamard256();
                         } else {
                             CUTE_NO_UNROLL
@@ -2245,10 +2246,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
 }
 
-template<typename Kernel, typename TMAParams>
+template<typename Kernel, typename TMAParams, bool PACKED_BU4 = false>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const TMAParams tma_params) {
-    Kernel::devfunc(params, tma_params);
+    Kernel::template devfunc<TMAParams, PACKED_BU4>(params, tma_params);
 }
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
@@ -2322,7 +2323,18 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
+    const bool packed_bu4 =
+        MODEL_TYPE == ModelType::MODEL1 &&
+        params.bit_uniform == 4 &&
+        params.identity_tail_bypass &&
+        params.packed_kcache_ptr != nullptr &&
+        (params.extra_kv == nullptr ||
+         params.extra_packed_kcache_ptr != nullptr);
+    auto mla_kernel = packed_bu4
+        ? &flash_fwd_splitkv_mla_fp8_sparse_kernel<
+              KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params), true>
+        : &flash_fwd_splitkv_mla_fp8_sparse_kernel<
+              KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params), false>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     // [c4c128-packed debug] One-shot host-side launch diagnostics for H20
