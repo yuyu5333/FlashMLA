@@ -39,6 +39,7 @@ from sglang.jit_kernel.rotated_quant_dsv4_kernels import (
     rotated_store_to_packed,
     _get_cached_cfg_gpu,
 )
+from sglang.jit_kernel.hadamard import hadamard_transform
 
 dev = torch.device("cuda:0")
 # The FlashMLA testcase generator (lib.generate_testcase_for_decode ->
@@ -68,7 +69,6 @@ BIT_UNIFORM = int(os.environ.get("PROBE_BIT_UNIFORM", "3"))
 Q_FOLD = int(os.environ.get("PROBE_Q_FOLD", "0"))
 COMPARE = int(os.environ.get("PROBE_COMPARE", "0"))
 R_IDENTITY = int(os.environ.get("PROBE_R_IDENTITY", "0"))
-Q_FOLD_FP32 = int(os.environ.get("PROBE_Q_FOLD_FP32", "0"))
 IDENTITY_TAIL_BYPASS = int(os.environ.get("PROBE_IDENTITY_TAIL_BYPASS", "0"))
 DEBUG_U32_LOAD = int(os.environ.get("PROBE_DEBUG_U32_LOAD", "0"))
 COMPARE_U32_LOAD = int(os.environ.get("PROBE_COMPARE_U32_LOAD", "0"))
@@ -149,21 +149,34 @@ if PROBE_NATIVE:
 q_call = t.q
 q_nope_is_folded = False
 q_folded = None
-if Q_FOLD and _bu > 0:
-    q_folded = t.q.clone()
-    if Q_FOLD_FP32:
-        q_folded[..., :QK_NOPE] = torch.matmul(
-            t.q[..., :QK_NOPE].float(), cfg_gpu["R"]
-        ).to(t.q.dtype)
-        print("[probe] q fold matmul uses fp32 q/R then casts to bf16")
-    else:
-        q_folded[..., :QK_NOPE] = torch.matmul(t.q[..., :QK_NOPE], cfg_gpu["R_bf16"])
+
+
+def fold_q_exact(q):
+    if _bu != 4 or not IDENTITY_TAIL_BYPASS:
+        raise RuntimeError(
+            "exact folded-Q requires PROBE_BIT_UNIFORM=4 and "
+            "PROBE_IDENTITY_TAIL_BYPASS=1"
+        )
+    folded = q.clone()
+    folded[..., :256] = hadamard_transform(q[..., :256], scale=0.0625)
+    return folded
+
+
+if Q_FOLD:
+    q_folded = fold_q_exact(t.q)
     q_call = q_folded
     q_nope_is_folded = True
-    print("[probe] q_nope_is_folded=True (q_nope @ R, producer writes x directly)")
+    print(
+        "[probe] q_nope_is_folded=True "
+        "(exact FP32 H256 butterfly, producer writes rotated K directly)"
+    )
 
 
-def one_call(q_arg=q_call, folded=q_nope_is_folded, debug_u32_load=DEBUG_U32_LOAD):
+def one_call_full(
+    q_arg=q_call,
+    folded=q_nope_is_folded,
+    debug_u32_load=DEBUG_U32_LOAD,
+):
     return flash_mla.flash_mla_with_kvcache(
         q=q_arg,
         k_cache=k_cache,
@@ -180,7 +193,11 @@ def one_call(q_arg=q_call, folded=q_nope_is_folded, debug_u32_load=DEBUG_U32_LOA
         identity_tail_bypass=bool(IDENTITY_TAIL_BYPASS),
         debug_u32_packed_load=bool(debug_u32_load),
         **packed_kwargs,
-    )[0]
+    )
+
+
+def one_call(q_arg=q_call, folded=q_nope_is_folded, debug_u32_load=DEBUG_U32_LOAD):
+    return one_call_full(q_arg, folded, debug_u32_load)[0]
 
 
 def print_diff(name, ref, cur):
@@ -212,24 +229,15 @@ if COMPARE_U32_LOAD and _bu > 0:
     torch.cuda.synchronize()
     print_diff("byte_load_vs_u32_load", out_byte, out_u32)
 
-if COMPARE and _bu > 0:
-    old_tail_bypass = IDENTITY_TAIL_BYPASS
-    IDENTITY_TAIL_BYPASS = 0
-    out_base = one_call(t.q, False)
+if COMPARE:
+    out_base, lse_base = one_call_full(t.q, False)
     torch.cuda.synchronize()
     if q_folded is None:
-        q_folded = t.q.clone()
-        if Q_FOLD_FP32:
-            q_folded[..., :QK_NOPE] = torch.matmul(
-                t.q[..., :QK_NOPE].float(), cfg_gpu["R"]
-            ).to(t.q.dtype)
-        else:
-            q_folded[..., :QK_NOPE] = torch.matmul(t.q[..., :QK_NOPE], cfg_gpu["R_bf16"])
-    IDENTITY_TAIL_BYPASS = old_tail_bypass
-    out_cmp_q = q_folded if q_nope_is_folded else t.q
-    out_fold = one_call(out_cmp_q, q_nope_is_folded)
+        q_folded = fold_q_exact(t.q)
+    out_fold, lse_fold = one_call_full(q_folded, True)
     torch.cuda.synchronize()
-    print_diff("base_vs_probe_path", out_base, out_fold)
+    print_diff("inverse_k_vs_folded_q_out", out_base, out_fold)
+    print_diff("inverse_k_vs_folded_q_lse", lse_base, lse_fold)
 
 for _ in range(ITERS):
     one_call()
