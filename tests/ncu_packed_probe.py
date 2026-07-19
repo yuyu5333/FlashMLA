@@ -39,7 +39,7 @@ from sglang.jit_kernel.rotated_quant_dsv4_kernels import (
     rotated_store_to_packed,
     _get_cached_cfg_gpu,
 )
-from sglang.jit_kernel.hadamard import hadamard_transform
+from sglang.jit_kernel.hadamard import _jit_hadamard_module, hadamard_transform
 
 dev = torch.device("cuda:0")
 # The FlashMLA testcase generator (lib.generate_testcase_for_decode ->
@@ -68,6 +68,7 @@ D_QK = 512
 BIT_UNIFORM = int(os.environ.get("PROBE_BIT_UNIFORM", "3"))
 Q_FOLD = int(os.environ.get("PROBE_Q_FOLD", "0"))
 COMPARE = int(os.environ.get("PROBE_COMPARE", "0"))
+TIMING = int(os.environ.get("PROBE_TIMING", "0"))
 R_IDENTITY = int(os.environ.get("PROBE_R_IDENTITY", "0"))
 IDENTITY_TAIL_BYPASS = int(os.environ.get("PROBE_IDENTITY_TAIL_BYPASS", "0"))
 DEBUG_U32_LOAD = int(os.environ.get("PROBE_DEBUG_U32_LOAD", "0"))
@@ -162,6 +163,16 @@ def fold_q_exact(q):
     return folded
 
 
+def hadamard256_inplace(x):
+    rows = x.reshape(-1, x.shape[-1])
+    prefix = rows.as_strided(
+        (rows.shape[0], 256),
+        (rows.stride(0), rows.stride(1)),
+    )
+    _jit_hadamard_module(x.dtype).hadamard_transform(prefix, prefix, 0.0625)
+    return x
+
+
 if Q_FOLD:
     q_folded = fold_q_exact(t.q)
     q_call = q_folded
@@ -235,9 +246,66 @@ if COMPARE:
     if q_folded is None:
         q_folded = fold_q_exact(t.q)
     out_fold, lse_fold = one_call_full(q_folded, True)
+    out_fold_restored = out_fold.clone()
+    hadamard256_inplace(out_fold_restored)
     torch.cuda.synchronize()
-    print_diff("inverse_k_vs_folded_q_out", out_base, out_fold)
+    print_diff("inverse_k_vs_folded_q_out_rotated", out_base, out_fold)
+    print_diff("inverse_k_vs_folded_q_out_restored", out_base, out_fold_restored)
     print_diff("inverse_k_vs_folded_q_lse", lse_base, lse_fold)
+
+
+if TIMING:
+    timing_iters = int(os.environ.get("PROBE_TIMING_ITERS", "100"))
+    q_timing = fold_q_exact(t.q)
+    out_timing, _ = one_call_full(q_timing, True)
+    q_inplace_timing = t.q.clone()
+    out_inplace_timing = out_timing.clone()
+
+    def folded_pipeline():
+        q_timed = fold_q_exact(t.q)
+        out_timed, _ = one_call_full(q_timed, True)
+        return torch.cat(
+            (
+                hadamard_transform(out_timed[..., :256], scale=0.0625),
+                out_timed[..., 256:],
+            ),
+            dim=-1,
+        )
+
+    for _ in range(10):
+        one_call(t.q, False)
+        folded_pipeline()
+    torch.cuda.synchronize()
+    for name, fn in (
+        ("inverse_k", lambda: one_call(t.q, False)),
+        ("q_fht_cat", lambda: fold_q_exact(t.q)),
+        ("folded_k_kernel", lambda: one_call(q_timing, True)),
+        (
+            "out_fht_cat",
+            lambda: torch.cat(
+                (
+                    hadamard_transform(out_timing[..., :256], scale=0.0625),
+                    out_timing[..., 256:],
+                ),
+                dim=-1,
+            ),
+        ),
+        ("q_fht_inplace", lambda: hadamard256_inplace(q_inplace_timing)),
+        ("out_fht_inplace", lambda: hadamard256_inplace(out_inplace_timing)),
+        ("folded_q_full_pipeline", folded_pipeline),
+    ):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(timing_iters):
+            fn()
+        end.record()
+        end.synchronize()
+        print(
+            f"[probe][timing] {name}: "
+            f"{start.elapsed_time(end) * 1000.0 / timing_iters:.3f} us"
+        )
+
 
 for _ in range(ITERS):
     one_call()
