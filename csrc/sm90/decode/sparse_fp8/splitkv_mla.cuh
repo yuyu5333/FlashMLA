@@ -1729,7 +1729,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             write_staging_tile_to_sK(k_base);
                         }
 #else
-                        if (PACKED_BU4 ||
+                        if (PACKED_BU4 && params.q_nope_is_folded) {
+                            CUTE_NO_UNROLL
+                            for (int kt = 0; kt < k_tiles; ++kt) {
+                                const int k_base = kt * 64;
+                                fill_sX_tile(k_base, false, true);
+                                cutlass::arch::fence_view_async_shared();
+                                NamedBarrier::sync(
+                                    128,
+                                    NamedBarriers::packed_kv_producer_sync);
+                            }
+                        } else if (PACKED_BU4 ||
                             (params.identity_tail_bypass && bu == 4)) {
                             run_warp_hadamard256();
                         } else {

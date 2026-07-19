@@ -430,12 +430,8 @@ sparse_attn_decode_interface(
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     KU_CHECK_SHAPE(q_for_extra, b, s_q, h_q, d_qk);
-    TORCH_CHECK(!q_nope_is_folded,
-        "q_nope_is_folded was rejected: Q@R fold changes the BF16 rounding "
-        "path and fails end-to-end correctness. Use identity_tail_bypass for "
-        "the safe K-side identity-tail optimization.");
     TORCH_CHECK(!q_for_extra.has_value(),
-        "q_for_extra is only meaningful for the rejected q_nope_is_folded path");
+        "q_for_extra is not supported by the packed-only folded-Q path");
     {
         // [M3.c.4 Stage-5 / B-step1] packed-FP8 path may pass a kv tensor
         // whose bytes_per_token is the packed row layout (e.g. 268 for
@@ -733,12 +729,18 @@ sparse_attn_decode_interface(
             // that reads N-bit uniform codes + per-group fp16 affine
             // header. bit_uniform == 0 keeps legacy.
             params.bit_uniform = static_cast<int>(bit_uniform);
+            params.q_nope_is_folded = q_nope_is_folded ? 1 : 0;
             params.identity_tail_bypass = identity_tail_bypass ? 1 : 0;
             params.debug_u32_packed_load = debug_u32_packed_load ? 1 : 0;
             TORCH_CHECK(!identity_tail_bypass || params.bit_uniform > 0,
                 "identity_tail_bypass requires bit_uniform>0");
             TORCH_CHECK(!debug_u32_packed_load || params.bit_uniform > 0,
                 "debug_u32_packed_load requires bit_uniform>0");
+            TORCH_CHECK(!q_nope_is_folded ||
+                            (params.bit_uniform == 4 &&
+                             identity_tail_bypass),
+                "q_nope_is_folded requires bit_uniform=4 and "
+                "identity_tail_bypass");
             if (params.bit_uniform > 0) {
                 params.uniform_group_size = 64;
                 TORCH_CHECK(qk_nope_head_dim_val % 64 == 0,
@@ -785,6 +787,11 @@ sparse_attn_decode_interface(
                     static_cast<int64_t>(extra_page_block_size) *
                     static_cast<int64_t>(packed_row_bytes_val);
             }
+            TORCH_CHECK(!q_nope_is_folded ||
+                            !extra_kv.has_value() ||
+                            params.extra_packed_kcache_ptr != nullptr,
+                "q_nope_is_folded requires every active extra pool to use "
+                "packed KV");
         }
     }
 
