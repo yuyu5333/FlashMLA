@@ -34,33 +34,29 @@ bf16x8 cvt_fp8x8_bf16x8(const fp8x8 &inputs, const __nv_bfloat162 &scale_bf162) 
 }
 
 __device__ __forceinline__
-float decode_e2m1(uint8_t code) {
-    float value;
-    switch (code & 0x7u) {
-        case 0: value = 0.0f; break;
-        case 1: value = 0.5f; break;
-        case 2: value = 1.0f; break;
-        case 3: value = 1.5f; break;
-        case 4: value = 2.0f; break;
-        case 5: value = 3.0f; break;
-        case 6: value = 4.0f; break;
-        default: value = 6.0f; break;
+uint16_t e2m1_to_bf16_bits(uint8_t code) {
+    const uint32_t magnitude = code & 0x7u;
+    const uint32_t exponent = magnitude >> 1;
+    uint32_t magnitude_bits = ((126u + exponent) << 7) | ((magnitude & 1u) << 6);
+    if (exponent == 0) {
+        magnitude_bits = magnitude == 0 ? 0 : 0x3f00u;
     }
-    return (code & 0x8u) == 0 ? value : -value;
+    return static_cast<uint16_t>(magnitude_bits | ((code & 0x8u) << 12));
 }
 
 __device__ __forceinline__
 bf16x8 cvt_e2m1x8_bf16x8(uint32_t packed, uint8_t scale_raw) {
     __nv_fp8_e4m3 scale_e4m3;
     scale_e4m3.__x = scale_raw;
-    const float scale = static_cast<float>(scale_e4m3);
+    const __nv_bfloat16 scale = __float2bfloat16(static_cast<float>(scale_e4m3));
+    const __nv_bfloat162 scale_bf162 = __bfloat162bfloat162(scale);
 
     auto decode_pair = [&](int byte_idx) {
         const uint8_t pair = static_cast<uint8_t>(packed >> (byte_idx * 8));
-        return __float22bfloat162_rn({
-            decode_e2m1(pair & 0x0fu) * scale,
-            decode_e2m1(pair >> 4) * scale,
-        });
+        const uint32_t values =
+            static_cast<uint32_t>(e2m1_to_bf16_bits(pair & 0x0fu)) |
+            (static_cast<uint32_t>(e2m1_to_bf16_bits(pair >> 4)) << 16);
+        return __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&values), scale_bf162);
     };
 
     return {
