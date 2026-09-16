@@ -569,28 +569,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::devfunc
                             );
                         }
 
-                        // Issue independent global loads before waiting for shared
-                        // storage. This overlaps the next tile's reads with MMA.
-                        uint64_t payload[HEAD_DIM_NOPE/64] = {};
-                        uint8_t scales[HEAD_DIM_NOPE/64] = {};
-                        bf16x8 rope[HEAD_DIM_ROPE/32] = {};
-                        if (token_index != -1) {
-                            CUTE_UNROLL
-                            for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; ++dim_idx) {
-                                payload[dim_idx] = load_64b_from_gmem<uint64_t, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(
-                                    gK_payload + dim_idx*32 + (lane_idx/8)*8
-                                );
-                                scales[dim_idx] = __ldg(gK_scales + dim_idx*4 + lane_idx/8);
-                            }
-                            CUTE_UNROLL
-                            for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; ++dim_idx) {
-                                rope[dim_idx] = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(
-                                    gK_rope + dim_idx*32 + (lane_idx/8)*8
-                                );
-                            }
-                        }
-
-                        // Wait before writing either local or peer shared memory.
+                        // Wait for the nope buffer to be available before writing either local or peer shared memory.
                         if (round == 0) {
                             plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
                         }
@@ -602,9 +581,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::devfunc
 
                         CUTE_UNROLL
                         for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; ++dim_idx) {
-                            const uint64_t packed_e2m1 = payload[dim_idx];
+                            uint64_t packed_e2m1 = 0;
+                            uint8_t scale_e4m3 = 0;
+                            if (token_index != -1) {
+                                packed_e2m1 = load_64b_from_gmem<uint64_t, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(
+                                    gK_payload + dim_idx*32 + (lane_idx/8)*8
+                                );
+                                scale_e4m3 = __ldg(gK_scales + dim_idx*4 + lane_idx/8);
+                            }
+
                             __nv_fp8_e4m3 scale_fp8;
-                            scale_fp8.__x = scales[dim_idx];
+                            scale_fp8.__x = scale_e4m3;
                             const __nv_bfloat162 scale_bf162 = __bfloat162bfloat162(
                                 __float2bfloat16(static_cast<float>(scale_fp8))
                             );
@@ -625,7 +612,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::devfunc
 
                         CUTE_UNROLL
                         for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; ++dim_idx) {
-                            const bf16x8 values = rope[dim_idx];
+                            bf16x8 values = {};
+                            if (token_index != -1) {
+                                values = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(
+                                    gK_rope + dim_idx*32 + (lane_idx/8)*8
+                                );
+                            }
                             const int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
                             *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&values;
                             if constexpr (CLUSTER_SIZE == 2) {
