@@ -109,7 +109,7 @@ def main():
                     q=q, k_cache=swa_cache, block_table=None, cache_seqlens=None,
                     head_dim_v=512, tile_scheduler_metadata=legacy_meta,
                     num_splits=legacy_splits, softmax_scale=512**-0.5,
-                    causal=False, is_fp8_kvcache=True, indices_in_kvcache=indices[0],
+                    causal=False, is_fp8_kvcache=True, indices=indices[0],
                     attn_sink=sink, extra_k_cache=legacy,
                     extra_indices_in_kvcache=indices[1], topk_length=lengths,
                     extra_topk_length=lengths,
