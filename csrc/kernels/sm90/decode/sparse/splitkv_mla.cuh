@@ -550,8 +550,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::devfunc
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
                     if constexpr (IS_PACKED_MAIN_BLOCK) {
-                        static_assert(MODEL_TYPE == ModelType::V4);
-                        static_assert(HEAD_DIM_NOPE == 448);
                         constexpr int PAYLOAD_BYTES_PER_TOKEN = HEAD_DIM_NOPE / 2;
                         constexpr int SCALE_BYTES_PER_TOKEN = 32;
                         constexpr int ROPE_BYTES_PER_TOKEN = HEAD_DIM_ROPE * sizeof(bf16);
