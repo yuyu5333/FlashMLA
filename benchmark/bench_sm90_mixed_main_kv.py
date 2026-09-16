@@ -125,8 +125,9 @@ def main():
             case = {
                 "heads": heads, "topk_each": topk,
                 "max_abs_error": (out.float() - out_ref.float()).abs().max().item(),
-                "main_packed_bytes": packed.numel() * packed.element_size(),
-                "main_legacy_bytes": legacy.numel() * legacy.element_size(),
+                "main_packed_bytes": packed.untyped_storage().nbytes(),
+                "main_legacy_bytes": legacy.untyped_storage().nbytes(),
+                "main_legacy_logical_bytes": legacy.numel() * legacy.element_size(),
             }
             for graph in ([True] if args.graph_only else [False, True]):
                 mode = "graph" if graph else "eager"
