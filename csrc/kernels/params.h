@@ -7,7 +7,8 @@ enum class ModelType {
     V4,         // DeepSeek V4 (d_qk=512)
     V41,        // DeepSeek V4.1 (d_qk=512, RoPE fp8, quant tile size 32)
     V41_FP4,    // DeepSeek V4.1 (d_qk=512, fp4 e2m1, quant tile size 16, e4m3 scales)
-    V32_NO_ROPE // DeepSeek V3.2 without RoPE (d_qk=512, V3.2's inline fp32 scales)
+    V32_NO_ROPE, // DeepSeek V3.2 without RoPE (d_qk=512, V3.2's inline fp32 scales)
+    DSV41_MAIN_FP4 // DSV4.1 Main KV: 448 e2m1 + 28 e4m3 scales + 64 bf16 RoPE, page-level SoA
 };
 
 struct __align__(4*8) DecodingSchedMeta {

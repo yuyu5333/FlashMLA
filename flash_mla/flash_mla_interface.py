@@ -25,6 +25,9 @@ class FlashMLASchedMeta:
 
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
+        api_variant: str = "legacy"
+        kv_format: Optional[str] = None
+        extra_kv_format: Optional[str] = None
 
     have_initialized: bool = False
 
@@ -148,6 +151,9 @@ def flash_mla_with_kvcache(
 
             extra_k_page_block_size,
             extra_topk,
+            "legacy",
+            kv_format,
+            str(extra_k_cache.shape[-1]) if extra_k_cache is not None else None,
         )
     else:
         # Check whether the input arguments are consistent with sched_meta
@@ -163,6 +169,9 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
+        assert sched_meta.config.api_variant == "legacy", "sched_meta was initialized for a different FlashMLA API." + helper_msg
+        assert sched_meta.config.kv_format == kv_format, "sched_meta.config.kv_format must match kv_format." + helper_msg
+        assert sched_meta.config.extra_kv_format == (str(extra_k_cache.shape[-1]) if extra_k_cache is not None else None), "sched_meta extra KV format must match extra_k_cache." + helper_msg
 
     if topk is not None:
         # Sparse attention
@@ -187,6 +196,90 @@ def flash_mla_with_kvcache(
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
     return (out, lse)
+
+
+def get_mla_capabilities() -> dict:
+    """Return machine-readable capabilities of the loaded FlashMLA extension."""
+    return flash_mla_cuda.get_mla_capabilities()
+
+
+def flash_mla_with_mixed_kvcache(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    main_cache_bytes: torch.Tensor,
+    main_indices: torch.Tensor,
+    swa_layout: str,
+    main_layout: str,
+    main_page_slots: int,
+    main_page_bytes: int,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    swa_topk_length: Optional[torch.Tensor] = None,
+    main_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SM90 mixed sparse attention over a V4 SWA cache and packed DSV4.1 Main cache."""
+    assert isinstance(tile_scheduler_metadata, FlashMLASchedMeta), (
+        "tile_scheduler_metadata must be of type FlashMLASchedMeta"
+    )
+    assert num_splits is None, "num_splits must be None"
+    assert swa_indices.ndim == 3 and main_indices.ndim == 3
+    assert main_cache_bytes.ndim == 2
+
+    sched_meta = tile_scheduler_metadata
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    config = FlashMLASchedMeta.Config(
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        swa_cache.shape[1],
+        swa_cache.shape[2],
+        False,
+        True,
+        swa_indices.shape[-1],
+        main_page_slots,
+        main_indices.shape[-1],
+        "mixed_v1",
+        swa_layout,
+        main_layout,
+    )
+    if not sched_meta.have_initialized:
+        sched_meta.have_initialized = True
+        sched_meta.config = config
+    else:
+        assert sched_meta.config == config, (
+            "input arguments are inconsistent with sched_meta; use distinct "
+            "scheduler metadata for staged/legacy and mixed-v1 calls"
+        )
+
+    out, lse, new_tile_scheduler_metadata, new_num_splits = (
+        flash_mla_cuda.sparse_decode_fwd_mixed_v1(
+            q,
+            swa_cache,
+            swa_indices,
+            swa_topk_length,
+            main_cache_bytes,
+            main_indices,
+            main_topk_length,
+            attn_sink,
+            sched_meta.tile_scheduler_metadata,
+            sched_meta.num_splits,
+            head_dim_v,
+            softmax_scale,
+            swa_layout,
+            main_layout,
+            main_page_slots,
+            main_page_bytes,
+        )
+    )
+    sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
+    sched_meta.num_splits = new_num_splits
+    return out, lse
 
 
 def flash_mla_sparse_fwd(

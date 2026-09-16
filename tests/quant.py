@@ -273,6 +273,81 @@ def dequantize_k_cache(
     return result
 
 
+def quantize_dsv41_main_kv(k: torch.Tensor) -> torch.Tensor:
+    """Pack [num_pages, page_slots, 512] into the 384-byte Main-KV v1 page layout."""
+    if k.ndim != 3 or k.shape[-1] != 512 or k.shape[1] not in (128, 256):
+        raise ValueError(f"invalid DSV4.1 Main-KV input shape: {tuple(k.shape)}")
+    if not bool(torch.isfinite(k).all().item()):
+        raise ValueError("DSV4.1 Main-KV input must be finite")
+
+    num_pages, page_slots, _ = k.shape
+    blocks = k.float().view(num_pages, page_slots, 32, 16)
+    amax = blocks.abs().amax(dim=-1)
+    scales = (amax / 6.0).clamp(2.0**-9, 448.0).to(torch.float8_e4m3fn)
+    codes = _quantize_to_e2m1(blocks / scales.float().unsqueeze(-1))
+
+    nope_codes = codes[..., :28, :].reshape(num_pages, page_slots, 448)
+    payload = nope_codes[..., 0::2] | (nope_codes[..., 1::2] << 4)
+    scale_rows = torch.zeros(
+        (num_pages, page_slots, 32), dtype=torch.uint8, device=k.device
+    )
+    scale_rows[..., :28] = scales[..., :28].view(torch.uint8)
+    rope = (
+        _dequantize_e2m1(codes[..., 28:, :])
+        * scales[..., 28:].float().unsqueeze(-1)
+    ).reshape(num_pages, page_slots, 64).to(torch.bfloat16).view(torch.uint8)
+
+    pages = torch.empty(
+        (num_pages, page_slots * 384), dtype=torch.uint8, device=k.device
+    )
+    payload_end = page_slots * 224
+    rope_offset = page_slots * 256
+    pages[:, :payload_end] = payload.reshape(num_pages, -1)
+    pages[:, payload_end:rope_offset] = scale_rows.reshape(num_pages, -1)
+    pages[:, rope_offset:] = rope.reshape(num_pages, -1)
+    return pages
+
+
+def dequantize_dsv41_main_kv(
+    pages: torch.Tensor, page_slots: int
+) -> torch.Tensor:
+    """Decode Main-KV v1 pages to [num_pages, page_slots, 512] BF16."""
+    if (
+        pages.dtype is not torch.uint8
+        or pages.ndim != 2
+        or page_slots not in (128, 256)
+        or pages.shape[1] != page_slots * 384
+    ):
+        raise ValueError(
+            f"invalid DSV4.1 Main-KV pages: shape={tuple(pages.shape)}, "
+            f"dtype={pages.dtype}, page_slots={page_slots}"
+        )
+
+    num_pages = pages.shape[0]
+    payload_end = page_slots * 224
+    rope_offset = page_slots * 256
+    payload = pages[:, :payload_end].reshape(num_pages, page_slots, 224)
+    scale_rows = pages[:, payload_end:rope_offset].reshape(
+        num_pages, page_slots, 32
+    )
+    codes = torch.empty(
+        (num_pages, page_slots, 448), dtype=torch.uint8, device=pages.device
+    )
+    codes[..., 0::2] = payload & 0xF
+    codes[..., 1::2] = payload >> 4
+    nope = (
+        _dequantize_e2m1(codes).view(num_pages, page_slots, 28, 16)
+        * scale_rows[..., :28].view(torch.float8_e4m3fn).float().unsqueeze(-1)
+    ).reshape(num_pages, page_slots, 448).to(torch.bfloat16)
+    rope = (
+        pages[:, rope_offset:]
+        .contiguous()
+        .view(torch.bfloat16)
+        .reshape(num_pages, page_slots, 64)
+    )
+    return torch.cat((nope, rope), dim=-1)
+
+
 def abs_indices2indices_in_kvcache(
     abs_indices: torch.Tensor,  # [b, s_q, topk]
     block_table: torch.Tensor,  # [b, /]

@@ -83,9 +83,9 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, ModelType EXTRA_MODEL_TYPE>
 template<typename TMAParams>
-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -487,23 +487,28 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                 int* indices_base;
                 int page_block_size;
+                int cache_num_blocks;
                 int64_t k_block_stride, k_row_stride;
-                fp8* k_ptr;
+                uint8_t* k_ptr;
                 if constexpr (!IS_EXTRA_BLOCK) {
                     indices_base = gIndices + (block_idx)*TOPK_BLOCK_SIZE;
                     page_block_size = params.page_block_size;
+                    cache_num_blocks = params.num_blocks;
                     k_block_stride = params.stride_kv_block;
                     k_row_stride = params.stride_kv_row;
-                    k_ptr = (fp8*)params.kv;
+                    k_ptr = (uint8_t*)params.kv;
                 } else {
                     indices_base = gExtraIndices + (block_idx-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE;
                     page_block_size = params.extra_page_block_size;
+                    cache_num_blocks = params.extra_num_blocks;
                     k_block_stride = params.stride_extra_kv_block;
                     k_row_stride = params.stride_extra_kv_row;
-                    k_ptr = (fp8*)params.extra_kv;
+                    k_ptr = (uint8_t*)params.extra_kv;
                 }
                 [[maybe_unused]] int topk_length = IS_EXTRA_BLOCK ? args.extra_topk_length : args.topk_length;
                 [[maybe_unused]] int rel_block_idx = IS_EXTRA_BLOCK ? (block_idx - args.num_orig_kv_blocks) : block_idx;
+                static constexpr bool IS_PACKED_MAIN_BLOCK =
+                    IS_EXTRA_BLOCK && EXTRA_MODEL_TYPE == ModelType::DSV41_MAIN_FP4;
                 transac_bar_t* peer_bar_k_remote_ready = get_peer_addr(&(plan.bar_k_remote_ready[buf_idx]));
 
                 CUTE_UNROLL
@@ -511,6 +516,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     int my_token_idx = my_token_idx_base + round*NUM_TOKENS_PER_ROUND;
                     bf16* sK_nope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*16)*TOPK_BLOCK_SIZE;
                     bf16* sK_nope_peer_base = get_peer_addr(sK_nope_base);
+                    bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
+                    bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
 
                     // Get prefetched token index
                     int token_index;
@@ -534,93 +541,161 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             token_index = -1;   // To prevent IMA when we have invalid (e.g. INT_MAX) topk indexes outside topk_length
                         }
                     }
+                    if (token_index < 0 ||
+                        static_cast<int64_t>(token_index) >= static_cast<int64_t>(cache_num_blocks) * page_block_size) {
+                        token_index = -1;
+                    }
 
                     int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
                     int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
 
-                    fp8* gK_base;
-                    bf16 scales[NUM_SCALES];
-                    if constexpr (IS_V32_LIKE) {
-                        static_assert(NUM_SCALES == 4);
-                        gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
-                        float scales_float[NUM_SCALES];
-                        *(float4*)(scales_float) = load_128b_from_gmem<float4, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>((float*)(gK_base+HEAD_DIM_NOPE));
-                        CUTE_UNROLL
-                        for (int i = 0; i < NUM_SCALES; ++i) {
-                            scales[i] = (bf16)scales_float[i];
-                        }
-                    } else {
-                        static_assert(NUM_SCALES == 8);
-                        gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*(HEAD_DIM_NOPE + HEAD_DIM_ROPE*sizeof(bf16));
-                        fp8_e8m0* gK_scales_base = (fp8_e8m0*)(k_ptr + block_index*k_block_stride + page_block_size*(HEAD_DIM_NOPE+HEAD_DIM_ROPE*sizeof(bf16)) + rel_idx_in_block*NUM_SCALES*sizeof(fp8_e8m0));
-                        fp8_e8m0 scales_e8m0[NUM_SCALES];
-                        *(int64_t*)scales_e8m0 = __ldg((int64_t*)gK_scales_base);
-                        CUTE_UNROLL
-                        for (int i = 0; i < NUM_SCALES; i += 2) {
-                            *(__nv_bfloat162_raw*)(scales+i) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(scales_e8m0+i));
-                        }
-                    }
+                    if constexpr (IS_PACKED_MAIN_BLOCK) {
+                        static_assert(MODEL_TYPE == ModelType::V4);
+                        static_assert(HEAD_DIM_NOPE == 448);
+                        constexpr int PAYLOAD_BYTES_PER_TOKEN = HEAD_DIM_NOPE / 2;
+                        constexpr int SCALE_BYTES_PER_TOKEN = 32;
+                        constexpr int ROPE_BYTES_PER_TOKEN = HEAD_DIM_ROPE * sizeof(bf16);
 
-                    // Wait for the nope buffer to be available
-                    if (round == 0) {
-                        plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
-                    }
-                    
-                    if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
-                        plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
-                    }
+                        const uint8_t* gK_payload = nullptr;
+                        const uint8_t* gK_scales = nullptr;
+                        const bf16* gK_rope = nullptr;
+                        if (token_index != -1) {
+                            const uint8_t* page = k_ptr + static_cast<int64_t>(block_index) * k_block_stride;
+                            gK_payload = page + static_cast<int64_t>(rel_idx_in_block) * PAYLOAD_BYTES_PER_TOKEN;
+                            gK_scales = page + static_cast<int64_t>(page_block_size) * PAYLOAD_BYTES_PER_TOKEN +
+                                static_cast<int64_t>(rel_idx_in_block) * SCALE_BYTES_PER_TOKEN;
+                            gK_rope = reinterpret_cast<const bf16*>(
+                                page + static_cast<int64_t>(page_block_size) *
+                                    (PAYLOAD_BYTES_PER_TOKEN + SCALE_BYTES_PER_TOKEN) +
+                                static_cast<int64_t>(rel_idx_in_block) * ROPE_BYTES_PER_TOKEN
+                            );
+                        }
 
-                    // Collectively copy from global memory and dequant
-                    // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
-                    
-                    fp8* gK_nope = gK_base + (lane_idx/8)*16;
-                    if (token_index == -1) {
+                        // Wait for the nope buffer to be available before writing either local or peer shared memory.
+                        if (round == 0) {
+                            plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
+                        }
+                        if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
+                            plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx(
+                                (TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16)
+                            );
+                        }
+
                         CUTE_UNROLL
-                        for (int i = 0; i < NUM_SCALES; ++i)
-                            scales[i] = (bf16)0.0f;
-                    }
-                    CUTE_UNROLL
-                    for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
-                        fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);   // We use EVICT_LAST here since gK_base may not be aligned to 32B (for V3.2) and the performance is the best among all cache hints (for DeepSeek-V4)
-                        bf16 scale = scales[IS_V32_LIKE ? dim_idx/2 : dim_idx];
-                        auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
-                            int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
-                            bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
-                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
-                            if constexpr (CLUSTER_SIZE == 2) {
-                                st_async_128b(sK_nope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; ++dim_idx) {
+                            uint64_t packed_e2m1 = 0;
+                            uint8_t scale_e4m3 = 0;
+                            if (token_index != -1) {
+                                packed_e2m1 = load_64b_from_gmem<uint64_t, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(
+                                    gK_payload + dim_idx*32 + (lane_idx/8)*8
+                                );
+                                scale_e4m3 = __ldg(gK_scales + dim_idx*4 + lane_idx/8);
                             }
-                        };
-                        if (token_index == -1)
-                            *(uint128_t*)(&cur_fp8x16) = uint128_t();
-                        dequant_and_save_bf16x8(cur_fp8x16.lo, 0);
-                        dequant_and_save_bf16x8(cur_fp8x16.hi, 8);
-                    }
 
-                    if constexpr (HEAD_DIM_ROPE == 0) continue;   // V3.2-no-RoPE: the whole head dim was handled above
-
-                    bf16* gK_rope;
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
-                        gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE+NUM_SCALES*sizeof(float)) + (lane_idx/8)*8;
-                    } else {
-                        gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE) + (lane_idx/8)*8;
-                    }
-                    bf16* sK_rope_base = plan.u.k[buf_idx].data() + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
-                    bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
-
-                    CUTE_UNROLL
-                    for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
-                        bf16x8 cur_bf16x8 = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim_idx*32);
-                        if constexpr (MODEL_TYPE == ModelType::V32) {
-                            // NOTE We do not need to mask the RoPE part for V3.2 since it isn't involved in the SV gemm
-                        } else {
-                            if (token_index == -1)
-                                *(uint128_t*)(&cur_bf16x8) = uint128_t();
+                            const bf16x8 values_lo = cvt_e2m1x8_bf16x8(
+                                static_cast<uint32_t>(packed_e2m1), scale_e4m3
+                            );
+                            const bf16x8 values_hi = cvt_e2m1x8_bf16x8(
+                                static_cast<uint32_t>(packed_e2m1 >> 32), scale_e4m3
+                            );
+                            const int smem_offset = dim_idx*64*TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&values_lo;
+                            *(__int128_t*)(sK_nope_base + smem_offset + 8*TOPK_BLOCK_SIZE) = *(__int128_t*)&values_hi;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sK_nope_peer_base + smem_offset, values_lo, peer_bar_k_remote_ready);
+                                st_async_128b(sK_nope_peer_base + smem_offset + 8*TOPK_BLOCK_SIZE, values_hi, peer_bar_k_remote_ready);
+                            }
                         }
-                        int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
-                        *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
-                        if constexpr (CLUSTER_SIZE == 2) {
-                            st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
+
+                        CUTE_UNROLL
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; ++dim_idx) {
+                            bf16x8 values = {};
+                            if (token_index != -1) {
+                                values = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(
+                                    gK_rope + dim_idx*32 + (lane_idx/8)*8
+                                );
+                            }
+                            const int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&values;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sK_rope_peer_base + smem_offset, values, peer_bar_k_remote_ready);
+                            }
+                        }
+                    } else {
+                        fp8* gK_base;
+                        bf16 scales[NUM_SCALES];
+                        if constexpr (IS_V32_LIKE) {
+                            static_assert(NUM_SCALES == 4);
+                            gK_base = (fp8*)(k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride);
+                            float scales_float[NUM_SCALES];
+                            *(float4*)(scales_float) = load_128b_from_gmem<float4, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>((float*)(gK_base+HEAD_DIM_NOPE));
+                            CUTE_UNROLL
+                            for (int i = 0; i < NUM_SCALES; ++i) {
+                                scales[i] = (bf16)scales_float[i];
+                            }
+                        } else {
+                            static_assert(NUM_SCALES == 8);
+                            gK_base = (fp8*)(k_ptr + block_index*k_block_stride + rel_idx_in_block*(HEAD_DIM_NOPE + HEAD_DIM_ROPE*sizeof(bf16)));
+                            fp8_e8m0* gK_scales_base = (fp8_e8m0*)(k_ptr + block_index*k_block_stride + page_block_size*(HEAD_DIM_NOPE+HEAD_DIM_ROPE*sizeof(bf16)) + rel_idx_in_block*NUM_SCALES*sizeof(fp8_e8m0));
+                            fp8_e8m0 scales_e8m0[NUM_SCALES];
+                            *(int64_t*)scales_e8m0 = __ldg((int64_t*)gK_scales_base);
+                            CUTE_UNROLL
+                            for (int i = 0; i < NUM_SCALES; i += 2) {
+                                *(__nv_bfloat162_raw*)(scales+i) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(scales_e8m0+i));
+                            }
+                        }
+
+                        if (round == 0) {
+                            plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
+                        }
+                        if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
+                            plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
+                        }
+
+                        fp8* gK_nope = gK_base + (lane_idx/8)*16;
+                        if (token_index == -1) {
+                            CUTE_UNROLL
+                            for (int i = 0; i < NUM_SCALES; ++i)
+                                scales[i] = (bf16)0.0f;
+                        }
+                        CUTE_UNROLL
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
+                            fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);
+                            bf16 scale = scales[IS_V32_LIKE ? dim_idx/2 : dim_idx];
+                            auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
+                                int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
+                                bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                                *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                                if constexpr (CLUSTER_SIZE == 2) {
+                                    st_async_128b(sK_nope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
+                                }
+                            };
+                            if (token_index == -1)
+                                *(uint128_t*)(&cur_fp8x16) = uint128_t();
+                            dequant_and_save_bf16x8(cur_fp8x16.lo, 0);
+                            dequant_and_save_bf16x8(cur_fp8x16.hi, 8);
+                        }
+
+                        if constexpr (HEAD_DIM_ROPE != 0) {
+                            bf16* gK_rope;
+                            if constexpr (MODEL_TYPE == ModelType::V32) {
+                                gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE+NUM_SCALES*sizeof(float)) + (lane_idx/8)*8;
+                            } else {
+                                gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE) + (lane_idx/8)*8;
+                            }
+                            CUTE_UNROLL
+                            for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
+                                bf16x8 cur_bf16x8 = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim_idx*32);
+                                if constexpr (MODEL_TYPE != ModelType::V32) {
+                                    if (token_index == -1)
+                                        *(uint128_t*)(&cur_bf16x8) = uint128_t();
+                                }
+                                int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
+                                *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                                if constexpr (CLUSTER_SIZE == 2) {
+                                    st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
+                                }
+                            }
                         }
                     }
                 }
@@ -630,11 +705,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 if (idx_in_warpgroup < 32) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
-                        if constexpr (IS_V32_LIKE) {
-                            return index != -1;
-                        } else {
-                            return index != -1 && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
-                        }
+                        const bool in_range = index >= 0 &&
+                            static_cast<int64_t>(index) < static_cast<int64_t>(cache_num_blocks) * page_block_size;
+                        return in_range && (IS_V32_LIKE ||
+                            rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length);
                     };
                     int2 indices = __ldg((int2*)(indices_base + lane_idx*2));
                     *(char2*)(&plan.is_kv_valid[buf_idx][lane_idx*2]) = {
@@ -685,8 +759,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
+template<ModelType MODEL_TYPE, int NUM_HEADS, ModelType EXTRA_MODEL_TYPE>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
     KU_ASSERT(params.d_qk == HEAD_DIM_K);
@@ -694,9 +768,17 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     KU_ASSERT(params.h_q % BLOCK_M == 0);
     if constexpr (MODEL_TYPE == ModelType::V4) {
         constexpr int BYTES_PER_TOKEN = HEAD_DIM_NOPE + 2*HEAD_DIM_ROPE + 8;
-        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
+        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each V4 SWA page must be contiguous for SM90 sparse decoding attention");
         if (params.extra_kv != nullptr) {
-            KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in DeepSeek-V4");  // Each block must be contiguous
+            KU_ASSERT(params.extra_topk % TOPK_BLOCK_SIZE == 0);
+            if constexpr (EXTRA_MODEL_TYPE == ModelType::DSV41_MAIN_FP4) {
+                KU_ASSERT(params.extra_page_block_size == 128 || params.extra_page_block_size == 256);
+                KU_ASSERT(params.stride_extra_kv_row == 384);
+                KU_ASSERT(params.stride_extra_kv_block ==
+                    static_cast<int64_t>(params.extra_page_block_size) * 384);
+            } else {
+                KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each V4 extra-KV page must be contiguous for SM90 sparse decoding attention");
+            }
         }
     } else {
         KU_ASSERT(params.extra_kv == nullptr, "V3.2 does not support extra KV cache");
@@ -751,7 +833,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -782,9 +864,9 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, ModelType EXTRA_MODEL_TYPE>
 void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
+    KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::run(params);
 }
 
 }

@@ -1,0 +1,11 @@
+#include "../splitkv_mla.cuh"
+
+namespace sm90::decode::sparse {
+
+template void run_flash_splitkv_mla_fp8_sparse_kernel<
+    ModelType::V4,
+    128,
+    ModelType::DSV41_MAIN_FP4
+>(const SparseAttnDecodeParams &params);
+
+}

@@ -30,6 +30,7 @@ enum class DecodeFeatures : int {
     V4_KVCACHE_FORMAT,
     V41_KVCACHE_FORMAT,
     V41_FP4_KVCACHE_FORMAT,
+    DSV41_MAIN_FP4_KVCACHE_FORMAT,
 
     ATTN_SINK,
     TOPK_LENGTH,
@@ -60,11 +61,18 @@ class Decode_Sm90_Impl : public DecodeImplBase {
         DecodeFeatures::V32_KVCACHE_FORMAT,
         DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT,
         DecodeFeatures::V4_KVCACHE_FORMAT,
+        DecodeFeatures::DSV41_MAIN_FP4_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
         DecodeFeatures::EXTRA_TOPK_LENGTH
     )
+    using SupportedKVFormats = KVFormatPairs<
+        KVFormatPair<ModelType::V32>,
+        KVFormatPair<ModelType::V32_NO_ROPE>,
+        KVFormatPair<ModelType::V4>,
+        KVFormatPair<ModelType::V4, ModelType::DSV41_MAIN_FP4>
+    >;
 
 public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
@@ -78,9 +86,9 @@ public:
 
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+        dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
-                sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
+                sm90::decode::sparse::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>(params);
             });
         });
     }
@@ -222,7 +230,7 @@ protected:
 
 
 std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
-sparse_attn_decode_interface(
+sparse_attn_decode_interface_impl(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
     const at::Tensor &kv,   // [num_blocks, page_block_size, h_k, d_qk]
     const at::Tensor &indices,    // [b, s_q, topk]
@@ -238,7 +246,8 @@ sparse_attn_decode_interface(
     // Names the format of `kv` ("V32", "V32_NO_ROPE", "V4", "V41"). Only needed to disambiguate V3.2-no-RoPE from V4.1,
     // which have the same d_qk and bytes per token; when omitted the format is detected from the shape and 528 B per
     // token means V3.2-no-RoPE, so pre-V4.1 callers keep working unchanged.
-    const std::optional<std::string> &kv_format
+    const std::optional<std::string> &kv_format,
+    const std::optional<ModelType> &extra_kv_format_override
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -341,10 +350,16 @@ sparse_attn_decode_interface(
         model_type = extra_model_type = ModelType::V32;
     } else if (d_qk == 512 && d_v == 512) {
         model_type = kv_format_hint.value_or(detect_kv_cache_format_for_headdim_512(kv.size(3), kv_format_hint));
-        extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3), model_type) : model_type;
+        extra_model_type = have_extra_kcache
+            ? (extra_kv_format_override.has_value()
+                ? *extra_kv_format_override
+                : detect_kv_cache_format_for_headdim_512(extra_kv->size(3), model_type))
+            : model_type;
     } else {
         TORCH_CHECK(false, "Unsupported head sizes for is_fp8_kvcache == True");
     }
+    TORCH_CHECK(!extra_kv_format_override.has_value() || have_extra_kcache,
+        "extra KV format override requires an extra KV cache");
     if (kv_format_hint.has_value()) {
         TORCH_CHECK(model_type == *kv_format_hint, "kv_format says ", get_dynamic_enum_name(*kv_format_hint),
             " but q/kv have d_qk ", d_qk, " and ", kv.size(3), " bytes per token");
@@ -407,6 +422,8 @@ sparse_attn_decode_interface(
             features.push_back(DecodeFeatures::V41_KVCACHE_FORMAT);
         } else if (mt == ModelType::V41_FP4) {
             features.push_back(DecodeFeatures::V41_FP4_KVCACHE_FORMAT);
+        } else if (mt == ModelType::DSV41_MAIN_FP4) {
+            features.push_back(DecodeFeatures::DSV41_MAIN_FP4_KVCACHE_FORMAT);
         } else {
             TORCH_CHECK(false, "Unsupported model type: ", (int)mt);
         }
@@ -551,6 +568,96 @@ sparse_attn_decode_interface(
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }
 
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits,
+    const std::optional<at::Tensor> &extra_kv,
+    const std::optional<at::Tensor> &extra_indices,
+    const std::optional<at::Tensor> &extra_topk_length,
+    int d_v,
+    float sm_scale,
+    const std::optional<std::string> &kv_format
+) {
+    return sparse_attn_decode_interface_impl(
+        q, kv, indices, topk_length, attn_sink,
+        tile_scheduler_metadata, num_splits,
+        extra_kv, extra_indices, extra_topk_length,
+        d_v, sm_scale, kv_format, std::nullopt
+    );
+}
+
+static bool is_dsv41_main_fp4_v1(const std::string &name) {
+    std::string upper;
+    for (char c : name) upper += (char)std::toupper((unsigned char)c);
+    return upper == "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1";
+}
+
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_mixed_decode_interface_v1(
+    const at::Tensor &q,
+    const at::Tensor &swa_cache,
+    const at::Tensor &swa_indices,
+    const std::optional<at::Tensor> &swa_topk_length,
+    const at::Tensor &main_cache_bytes,
+    const at::Tensor &main_indices,
+    const std::optional<at::Tensor> &main_topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits,
+    int d_v,
+    float sm_scale,
+    const std::string &swa_layout,
+    const std::string &main_layout,
+    int main_page_slots,
+    int main_page_bytes
+) {
+    TORCH_CHECK(parse_kv_cache_format(swa_layout) == ModelType::V4,
+        "sparse_decode_fwd_mixed_v1 only supports swa_layout=V4");
+    TORCH_CHECK(is_dsv41_main_fp4_v1(main_layout),
+        "sparse_decode_fwd_mixed_v1 only supports "
+        "main_layout=DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1");
+    TORCH_CHECK(main_page_slots == 128 || main_page_slots == 256,
+        "main_page_slots must be 128 or 256, got ", main_page_slots);
+    TORCH_CHECK(main_page_bytes == main_page_slots * 384,
+        "main_page_bytes must equal main_page_slots * 384, got ",
+        main_page_bytes, " for ", main_page_slots, " slots");
+    TORCH_CHECK(main_cache_bytes.dim() == 2,
+        "main_cache_bytes must be 2D [num_pages, main_page_bytes], got ",
+        main_cache_bytes.sizes());
+    TORCH_CHECK(main_cache_bytes.scalar_type() == at::kByte,
+        "main_cache_bytes must have dtype uint8");
+    TORCH_CHECK(main_cache_bytes.is_contiguous(),
+        "main_cache_bytes must be contiguous");
+    TORCH_CHECK(main_cache_bytes.size(0) > 0,
+        "main_cache_bytes must contain at least one page");
+    TORCH_CHECK(main_cache_bytes.size(1) == main_page_bytes,
+        "main_cache_bytes page width does not match main_page_bytes: ",
+        main_cache_bytes.size(1), " != ", main_page_bytes);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(main_cache_bytes.data_ptr()) % 16 == 0,
+        "main_cache_bytes must be at least 16-byte aligned");
+
+    at::Tensor main_cache_view = main_cache_bytes.as_strided(
+        {main_cache_bytes.size(0), main_page_slots, 1, 384},
+        {main_page_bytes, 384, 384, 1}
+    );
+    std::optional<at::Tensor> main_cache = main_cache_view;
+    std::optional<at::Tensor> main_indices_opt = main_indices;
+    const std::optional<std::string> swa_format = swa_layout;
+    const std::optional<ModelType> main_format = ModelType::DSV41_MAIN_FP4;
+    return sparse_attn_decode_interface_impl(
+        q, swa_cache, swa_indices, swa_topk_length, attn_sink,
+        tile_scheduler_metadata, num_splits,
+        main_cache, main_indices_opt, main_topk_length,
+        d_v, sm_scale, swa_format, main_format
+    );
+}
+
 #ifndef FLASH_MLA_LIBTORCH_ONLY
 void register_sparse_decode(pybind11::module_& m) {
     m.def("sparse_decode_fwd",
@@ -562,5 +669,32 @@ void register_sparse_decode(pybind11::module_& m) {
         pybind11::arg("extra_kv"), pybind11::arg("extra_indices"), pybind11::arg("extra_topk_length"),
         pybind11::arg("d_v"), pybind11::arg("sm_scale"),
         pybind11::arg("kv_format") = pybind11::none());
+    m.def("sparse_decode_fwd_mixed_v1",
+        &sparse_attn_mixed_decode_interface_v1,
+        "Run SM90 sparse decode with a V4 SWA cache and packed DSV4.1 Main KV cache",
+        pybind11::arg("q"),
+        pybind11::arg("swa_cache"), pybind11::arg("swa_indices"), pybind11::arg("swa_topk_length"),
+        pybind11::arg("main_cache_bytes"), pybind11::arg("main_indices"), pybind11::arg("main_topk_length"),
+        pybind11::arg("attn_sink"),
+        pybind11::arg("tile_scheduler_metadata"), pybind11::arg("num_splits"),
+        pybind11::arg("d_v"), pybind11::arg("sm_scale"),
+        pybind11::arg("swa_layout"), pybind11::arg("main_layout"),
+        pybind11::arg("main_page_slots"), pybind11::arg("main_page_bytes"));
+    m.def("get_mla_capabilities", []() {
+        Arch arch;
+        pybind11::dict result;
+        result["mixed_kvcache_api_version"] = 1;
+        result["architecture"] =
+            arch.is_sm90a() ? "sm90" : (arch.is_sm100f() ? "sm100" : "unsupported");
+        result["mixed_kvcache_supported"] = arch.is_sm90a();
+        result["supported_mixed_layout_pairs"] = arch.is_sm90a()
+            ? std::vector<std::vector<std::string>>{{
+                "V4", "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"
+            }}
+            : std::vector<std::vector<std::string>>{};
+        result["supported_num_heads"] = std::vector<int>{64, 128};
+        result["supported_main_page_slots"] = std::vector<int>{128, 256};
+        return result;
+    });
 }
 #endif

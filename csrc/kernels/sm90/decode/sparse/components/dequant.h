@@ -33,6 +33,44 @@ bf16x8 cvt_fp8x8_bf16x8(const fp8x8 &inputs, const __nv_bfloat162 &scale_bf162) 
     return result;
 }
 
+__device__ __forceinline__
+float decode_e2m1(uint8_t code) {
+    float value;
+    switch (code & 0x7u) {
+        case 0: value = 0.0f; break;
+        case 1: value = 0.5f; break;
+        case 2: value = 1.0f; break;
+        case 3: value = 1.5f; break;
+        case 4: value = 2.0f; break;
+        case 5: value = 3.0f; break;
+        case 6: value = 4.0f; break;
+        default: value = 6.0f; break;
+    }
+    return (code & 0x8u) == 0 ? value : -value;
+}
+
+__device__ __forceinline__
+bf16x8 cvt_e2m1x8_bf16x8(uint32_t packed, uint8_t scale_raw) {
+    __nv_fp8_e4m3 scale_e4m3;
+    scale_e4m3.__x = scale_raw;
+    const float scale = static_cast<float>(scale_e4m3);
+
+    auto decode_pair = [&](int byte_idx) {
+        const uint8_t pair = static_cast<uint8_t>(packed >> (byte_idx * 8));
+        return __float22bfloat162_rn({
+            decode_e2m1(pair & 0x0fu) * scale,
+            decode_e2m1(pair >> 4) * scale,
+        });
+    };
+
+    return {
+        decode_pair(0),
+        decode_pair(1),
+        decode_pair(2),
+        decode_pair(3),
+    };
+}
+
 enum class L1CacheHint {
     NO_ALLOCATE,
     EVICT_FIRST,

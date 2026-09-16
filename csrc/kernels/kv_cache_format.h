@@ -41,13 +41,17 @@ constexpr int kv_cache_bytes_per_token(ModelType mt) {
         case ModelType::V41: return KVCacheFormat<ModelType::V41>::BYTES_PER_TOKEN;
         case ModelType::V41_FP4: return KVCacheFormat<ModelType::V41_FP4>::BYTES_PER_TOKEN;
         case ModelType::V32_NO_ROPE: return KVCacheFormat<ModelType::V32_NO_ROPE>::BYTES_PER_TOKEN;
+        case ModelType::DSV41_MAIN_FP4: return 384;
     }
     return 0;
 }
 
-// The (kv, extra_kv) format pairs that exist: extra_kv has the format of kv, or is the V4.1 fp4 cache next to a V4.1 (fp8) kv.
+// The (kv, extra_kv) format pairs that exist. DSV41_MAIN_FP4 is the versioned 384-byte page-level SoA
+// layout and is only valid as the Main cache next to a V4 SWA cache.
 constexpr bool is_valid_kv_format_pair(ModelType kv, ModelType extra_kv) {
-    return extra_kv == kv || (kv == ModelType::V41 && extra_kv == ModelType::V41_FP4);
+    return extra_kv == kv ||
+           (kv == ModelType::V41 && extra_kv == ModelType::V41_FP4) ||
+           (kv == ModelType::V4 && extra_kv == ModelType::DSV41_MAIN_FP4);
 }
 
 template<ModelType KV, ModelType EXTRA_KV = KV>

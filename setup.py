@@ -85,6 +85,8 @@ ext_modules.append(
             # sm90 sparse decode
             "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
             "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
+            "csrc/kernels/sm90/decode/sparse/instantiations/v4_dsv41_main_fp4_persistent_h64.cu",
+            "csrc/kernels/sm90/decode/sparse/instantiations/v4_dsv41_main_fp4_persistent_h128.cu",
             "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu",
             "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
             "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu",

@@ -6,17 +6,18 @@
 #include <kerutils/kerutils.cuh>
 
 #include "kernels/defines.h"
-#include "kernels/params.h"
+#include "kernels/kv_cache_format.h"
 
 using namespace cute;
 
 namespace sm90::decode::sparse {
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, ModelType EXTRA_MODEL_TYPE = MODEL_TYPE>
 class KernelTemplate {
 public:
 
 static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
+static_assert(is_valid_kv_format_pair(MODEL_TYPE, EXTRA_MODEL_TYPE));
 static constexpr int NUM_M_BLOCKS = NUM_HEADS / 64;
 static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
