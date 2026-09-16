@@ -45,26 +45,25 @@ uint16_t e2m1_to_bf16_bits(uint8_t code) {
 }
 
 __device__ __forceinline__
-bf16x8 cvt_e2m1x8_bf16x8(uint32_t packed, uint8_t scale_raw) {
-    __nv_fp8_e4m3 scale_e4m3;
-    scale_e4m3.__x = scale_raw;
-    const __nv_bfloat16 scale = __float2bfloat16(static_cast<float>(scale_e4m3));
-    const __nv_bfloat162 scale_bf162 = __bfloat162bfloat162(scale);
-
-    auto decode_pair = [&](int byte_idx) {
-        const uint8_t pair = static_cast<uint8_t>(packed >> (byte_idx * 8));
-        const uint32_t values =
-            static_cast<uint32_t>(e2m1_to_bf16_bits(pair & 0x0fu)) |
-            (static_cast<uint32_t>(e2m1_to_bf16_bits(pair >> 4)) << 16);
-        return __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&values), scale_bf162);
+bf16x8 cvt_e2m1x8_bf16x8(uint32_t packed, const __nv_bfloat162 &scale_bf162) {
+    auto decode_four = [&](uint32_t codes, __nv_bfloat162 &lo, __nv_bfloat162 &hi) {
+        // Magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6 as BF16 bytes.
+        // Both tables stay in registers; PRMT selects four entries at once.
+        const uint32_t selectors = codes & 0x7777u;
+        const uint32_t low_bytes = __byte_perm(0xc0800000u, 0xc0804000u, selectors);
+        const uint32_t high_bytes = __byte_perm(0x3f3f3f00u, 0x40404040u, selectors);
+        const uint32_t signs_lo = ((codes << 12) | (codes << 24)) & 0x80008000u;
+        const uint32_t signs_hi = ((codes << 4) | (codes << 16)) & 0x80008000u;
+        const uint32_t bits_lo = __byte_perm(low_bytes, high_bytes, 0x5140) | signs_lo;
+        const uint32_t bits_hi = __byte_perm(low_bytes, high_bytes, 0x7362) | signs_hi;
+        lo = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&bits_lo), scale_bf162);
+        hi = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&bits_hi), scale_bf162);
     };
 
-    return {
-        decode_pair(0),
-        decode_pair(1),
-        decode_pair(2),
-        decode_pair(3),
-    };
+    bf16x8 result;
+    decode_four(packed & 0xffffu, result.a01, result.a23);
+    decode_four(packed >> 16, result.a45, result.a67);
+    return result;
 }
 
 enum class L1CacheHint {

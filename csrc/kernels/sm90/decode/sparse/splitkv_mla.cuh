@@ -590,11 +590,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, EXTRA_MODEL_TYPE>::devfunc
                                 scale_e4m3 = __ldg(gK_scales + dim_idx*4 + lane_idx/8);
                             }
 
+                            __nv_fp8_e4m3 scale_fp8;
+                            scale_fp8.__x = scale_e4m3;
+                            const __nv_bfloat162 scale_bf162 = __bfloat162bfloat162(
+                                __float2bfloat16(static_cast<float>(scale_fp8))
+                            );
                             const bf16x8 values_lo = cvt_e2m1x8_bf16x8(
-                                static_cast<uint32_t>(packed_e2m1), scale_e4m3
+                                static_cast<uint32_t>(packed_e2m1), scale_bf162
                             );
                             const bf16x8 values_hi = cvt_e2m1x8_bf16x8(
-                                static_cast<uint32_t>(packed_e2m1 >> 32), scale_e4m3
+                                static_cast<uint32_t>(packed_e2m1 >> 32), scale_bf162
                             );
                             const int smem_offset = dim_idx*64*TOPK_BLOCK_SIZE;
                             *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&values_lo;
